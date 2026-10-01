@@ -1,0 +1,4 @@
+build/
+wirewatch
+*.o
+*.dSYM/
