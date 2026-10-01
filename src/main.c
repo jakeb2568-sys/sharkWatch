@@ -25,6 +25,7 @@ struct stats {
 struct ctx {
     int linktype;
     bool verbose;
+    bool tsv;
     bool have_t0;
     struct timeval t0;
     struct stats st;
@@ -83,7 +84,10 @@ static void on_packet(u_char *user, const struct pcap_pkthdr *hdr,
 
     int rc = decode_packet(c->linktype, hdr, bytes, &pkt);
     count(&c->st, &pkt, rc);
-    print_packet(stdout, &pkt, c->st.packets, seconds_since(&c->t0, &hdr->ts), c->verbose);
+    if (c->tsv)
+        print_packet_tsv(stdout, &pkt, c->st.packets);
+    else
+        print_packet(stdout, &pkt, c->st.packets, seconds_since(&c->t0, &hdr->ts), c->verbose);
 }
 
 static void print_summary(FILE *out, const struct stats *s)
@@ -107,6 +111,7 @@ static void usage(FILE *out, const char *prog)
             "  -c N        stop after N packets\n"
             "  -s SNAPLEN  bytes to capture per packet (default %d)\n"
             "  -v          verbose: add an L2/L3 detail line per packet\n"
+            "  -T          tab-separated fields instead (see print.h for columns)\n"
             "  -h          show this help\n"
             "\n"
             "Anything after the options is a BPF filter, same syntax as\n"
@@ -138,13 +143,14 @@ int main(int argc, char **argv)
     int max_packets = -1, snaplen = DEFAULT_SNAPLEN, opt;
     struct ctx c = { 0 };
 
-    while ((opt = getopt(argc, argv, "r:i:c:s:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "r:i:c:s:vTh")) != -1) {
         switch (opt) {
         case 'r': file = optarg; break;
         case 'i': iface = optarg; break;
         case 'c': max_packets = atoi(optarg); break;
         case 's': snaplen = atoi(optarg); break;
         case 'v': c.verbose = true; break;
+        case 'T': c.tsv = true; break;
         case 'h': usage(stdout, argv[0]); return EXIT_SUCCESS;
         default:  usage(stderr, argv[0]); return EXIT_FAILURE;
         }

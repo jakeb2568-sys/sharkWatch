@@ -66,9 +66,66 @@ struct ipv4_hdr {
     uint32_t dst;
 };
 
+/* ---- TCP (RFC 9293) ---------------------------------------------------- */
+
+#define TCP_MIN_HDR_LEN 20
+
+#define TCPF_FIN 0x01
+#define TCPF_SYN 0x02
+#define TCPF_RST 0x04
+#define TCPF_PSH 0x08
+#define TCPF_ACK 0x10
+#define TCPF_URG 0x20
+#define TCPF_ECE 0x40
+#define TCPF_CWR 0x80
+
+struct tcp_hdr {
+    uint16_t sport;
+    uint16_t dport;
+    uint32_t seq;
+    uint32_t ack;
+    uint8_t  data_off;          /* high nibble: header length in 32-bit words */
+    uint8_t  flags;
+    uint16_t window;
+    uint16_t checksum;
+    uint16_t urgent;
+};
+
+/* ---- UDP (RFC 768) ----------------------------------------------------- */
+
+#define UDP_HDR_LEN 8
+
+struct udp_hdr {
+    uint16_t sport;
+    uint16_t dport;
+    uint16_t length;            /* header + payload */
+    uint16_t checksum;
+};
+
+/* ---- ICMP (RFC 792) ---------------------------------------------------- */
+
+#define ICMP_HDR_LEN 8
+
+#define ICMP_ECHO_REPLY     0
+#define ICMP_DEST_UNREACH   3
+#define ICMP_REDIRECT       5
+#define ICMP_ECHO_REQUEST   8
+#define ICMP_TIME_EXCEEDED  11
+
+struct icmp_hdr {
+    uint8_t  type;
+    uint8_t  code;
+    uint16_t checksum;
+    uint16_t id;                /* only meaningful for echo request/reply */
+    uint16_t seq;               /* ditto */
+};
+
 /* The compiler must not insert padding, or our offsets would be wrong. */
 _Static_assert(sizeof(struct eth_hdr)  == ETH_HDR_LEN,      "eth_hdr size");
 _Static_assert(sizeof(struct vlan_tag) == VLAN_TAG_LEN,     "vlan_tag size");
 _Static_assert(sizeof(struct ipv4_hdr) == IPV4_MIN_HDR_LEN, "ipv4_hdr size");
+_Static_assert(sizeof(struct tcp_hdr)  == TCP_MIN_HDR_LEN,  "tcp_hdr size");
+_Static_assert(sizeof(struct udp_hdr)  == UDP_HDR_LEN,      "udp_hdr size");
+_Static_assert(sizeof(struct icmp_hdr) == ICMP_HDR_LEN,     "icmp_hdr size");
 
 #endif

@@ -12,6 +12,14 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+typedef enum {
+    L4_NONE = 0,    /* not IPv4, a non-first fragment, or decoding stopped early */
+    L4_TCP,
+    L4_UDP,
+    L4_ICMP,
+    L4_OTHER,       /* IPv4 carrying some other protocol (GRE, ESP, ...) */
+} l4_type_t;
+
 typedef struct {
     /* ---- frame ---- */
     struct timeval ts;
@@ -35,6 +43,22 @@ typedef struct {
     uint16_t ip_id;
     bool     dont_fragment, more_fragments;
     uint16_t frag_offset;       /* bytes */
+
+    /* ---- layer 4 ---- */
+    l4_type_t l4;               /* which of the fields below are valid */
+    uint16_t src_port, dst_port;        /* TCP, UDP */
+    uint32_t tcp_seq, tcp_ack;          /* raw, not relative like Wireshark shows */
+    uint8_t  tcp_flags;
+    uint8_t  tcp_hdr_len;               /* bytes, 20..60 */
+    uint16_t tcp_window;
+    uint16_t udp_len;                   /* from the UDP header */
+    uint8_t  icmp_type, icmp_code;
+    uint16_t icmp_id, icmp_seq;         /* echo request/reply only */
+
+    /* ---- payload (after the deepest header we decoded) ---- */
+    const uint8_t *payload;     /* points into the captured bytes */
+    uint32_t payload_len;       /* length on the wire, per the IP/UDP lengths */
+    uint32_t payload_caplen;    /* how much of it was actually captured */
 
     /* ---- problems ---- */
     const char *error;          /* NULL if decoded cleanly, else a static message */

@@ -42,20 +42,142 @@ static const char *ip_proto_name(uint8_t p)
     }
 }
 
+/* "[SYN, ACK]" - same wording Wireshark uses in its Info column. */
+static const char *tcp_flags_str(uint8_t f, char *buf, size_t n)
+{
+    static const struct { uint8_t bit; const char *name; } names[] = {
+        { TCPF_FIN, "FIN" }, { TCPF_SYN, "SYN" }, { TCPF_RST, "RST" },
+        { TCPF_PSH, "PSH" }, { TCPF_ACK, "ACK" }, { TCPF_URG, "URG" },
+        { TCPF_ECE, "ECE" }, { TCPF_CWR, "CWR" },
+    };
+    size_t used = (size_t)snprintf(buf, n, "[");
+    bool first = true;
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+        if (!(f & names[i].bit))
+            continue;
+        used += (size_t)snprintf(buf + used, n - used, "%s%s",
+                                 first ? "" : ", ", names[i].name);
+        first = false;
+    }
+    if (first)
+        used += (size_t)snprintf(buf + used, n - used, "<none>");
+    snprintf(buf + used, n - used, "]");
+    return buf;
+}
+
+static const char *icmp_name(uint8_t type, uint8_t code)
+{
+    switch (type) {
+    case ICMP_ECHO_REPLY:    return "echo reply";
+    case ICMP_ECHO_REQUEST:  return "echo request";
+    case ICMP_REDIRECT:      return "redirect";
+    case ICMP_TIME_EXCEEDED: return code == 0 ? "time exceeded (TTL)" : "time exceeded (reassembly)";
+    case ICMP_DEST_UNREACH:
+        switch (code) {
+        case 0:  return "destination unreachable (network)";
+        case 1:  return "destination unreachable (host)";
+        case 2:  return "destination unreachable (protocol)";
+        case 3:  return "destination unreachable (port)";
+        case 4:  return "destination unreachable (fragmentation needed)";
+        case 13: return "destination unreachable (administratively prohibited)";
+        default: return "destination unreachable";
+        }
+    default: return NULL;
+    }
+}
+
 static void print_ipv4(FILE *out, const packet_t *pkt)
 {
     char s[INET_ADDRSTRLEN], d[INET_ADDRSTRLEN];
     const char *name = ip_proto_name(pkt->ip_proto);
 
-    fprintf(out, "%s -> %s  ", ip_str(pkt->src_ip, s), ip_str(pkt->dst_ip, d));
+    ip_str(pkt->src_ip, s);
+    ip_str(pkt->dst_ip, d);
+
+    /* Endpoints: with ports if we decoded a TCP/UDP header. */
+    if (pkt->l4 == L4_TCP || pkt->l4 == L4_UDP)
+        fprintf(out, "%s:%u -> %s:%u  ", s, pkt->src_port, d, pkt->dst_port);
+    else
+        fprintf(out, "%s -> %s  ", s, d);
+
     if (name)
         fprintf(out, "%s", name);
     else
         fprintf(out, "IPv4 proto=%u", pkt->ip_proto);
+
+    switch (pkt->l4) {
+    case L4_TCP: {
+        char flags[64];
+        fprintf(out, " %s seq=%u", tcp_flags_str(pkt->tcp_flags, flags, sizeof flags),
+                pkt->tcp_seq);
+        if (pkt->tcp_flags & TCPF_ACK)
+            fprintf(out, " ack=%u", pkt->tcp_ack);
+        fprintf(out, " win=%u len=%u", pkt->tcp_window, pkt->payload_len);
+        break;
+    }
+    case L4_UDP:
+        fprintf(out, " len=%u", pkt->payload_len);
+        break;
+    case L4_ICMP: {
+        const char *what = icmp_name(pkt->icmp_type, pkt->icmp_code);
+        if (what)
+            fprintf(out, " %s", what);
+        else
+            fprintf(out, " type=%u code=%u", pkt->icmp_type, pkt->icmp_code);
+        if (pkt->icmp_type == ICMP_ECHO_REQUEST || pkt->icmp_type == ICMP_ECHO_REPLY)
+            fprintf(out, " id=0x%04x seq=%u", pkt->icmp_id, pkt->icmp_seq);
+        break;
+    }
+    case L4_OTHER:
+        fprintf(out, " len=%u", pkt->payload_len);
+        break;
+    case L4_NONE:
+        if (pkt_is_fragment(pkt))   /* later fragment: just more payload */
+            fprintf(out, " len=%u", pkt->payload_len);
+        break;
+    }
+
     if (pkt_is_fragment(pkt))
-        fprintf(out, " (fragment id=0x%04x off=%u%s)", pkt->ip_id,
+        fprintf(out, "  (fragment id=0x%04x off=%u%s)", pkt->ip_id,
                 pkt->frag_offset, pkt->more_fragments ? " MF" : "");
-    fprintf(out, " len=%u", pkt->ip_total_len);
+}
+
+void print_packet_tsv(FILE *out, const packet_t *pkt, uint64_t frame_no)
+{
+    char s[INET_ADDRSTRLEN] = "", d[INET_ADDRSTRLEN] = "";
+    if (pkt->has_ipv4) {
+        ip_str(pkt->src_ip, s);
+        ip_str(pkt->dst_ip, d);
+    }
+
+    fprintf(out, "%llu\t%s\t%s\t", (unsigned long long)frame_no, s, d);
+    if (pkt->has_ipv4)
+        fprintf(out, "%u\t%u", pkt->ip_proto, pkt->ttl);
+    else
+        fputc('\t', out);
+
+    if (pkt->l4 == L4_TCP || pkt->l4 == L4_UDP)
+        fprintf(out, "\t%u\t%u", pkt->src_port, pkt->dst_port);
+    else
+        fprintf(out, "\t\t");
+
+    if (pkt->l4 == L4_TCP)
+        fprintf(out, "\t0x%04x\t%u\t%u\t%u", pkt->tcp_flags, pkt->tcp_seq,
+                pkt->tcp_ack, pkt->payload_len);
+    else
+        fprintf(out, "\t\t\t\t");
+
+    if (pkt->l4 == L4_UDP)
+        fprintf(out, "\t%u", pkt->udp_len);
+    else
+        fputc('\t', out);
+
+    if (pkt->l4 == L4_ICMP)
+        fprintf(out, "\t%u\t%u", pkt->icmp_type, pkt->icmp_code);
+    else
+        fprintf(out, "\t\t");
+
+    fprintf(out, "\t%s\n", pkt->error ? pkt->error : "");
 }
 
 static void print_l2_only(FILE *out, const packet_t *pkt)

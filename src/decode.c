@@ -11,6 +11,11 @@
 #include <arpa/inet.h>
 #include <string.h>
 
+/* Older libpcap (< 1.10, e.g. some macOS versions) predates cooked v2. */
+#ifndef DLT_LINUX_SLL2
+#define DLT_LINUX_SLL2 276
+#endif
+
 static int fail(packet_t *pkt, const char *why)
 {
     pkt->error = why;
@@ -22,6 +27,105 @@ bool decode_linktype_supported(int linktype)
     return linktype == DLT_EN10MB ||
            linktype == DLT_LINUX_SLL ||
            linktype == DLT_LINUX_SLL2;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Layer 4                                                                  */
+/*                                                                          */
+/* Each decoder gets two lengths:                                           */
+/*   cap  - bytes we actually have in memory starting at p                  */
+/*   wire - bytes the IP header says the segment is                         */
+/* They differ when snaplen truncated the capture (cap < wire).             */
+/* ------------------------------------------------------------------------ */
+
+static void set_payload(packet_t *pkt, const uint8_t *p, uint32_t cap,
+                        uint32_t wire, uint32_t hdr_len)
+{
+    pkt->payload        = p + hdr_len;
+    pkt->payload_len    = wire > hdr_len ? wire - hdr_len : 0;
+    pkt->payload_caplen = cap  > hdr_len ? cap  - hdr_len : 0;
+}
+
+static int decode_tcp(const uint8_t *p, uint32_t cap, uint32_t wire, packet_t *pkt)
+{
+    if (wire < TCP_MIN_HDR_LEN)
+        return fail(pkt, "IP datagram too short for a TCP header");
+    if (cap < TCP_MIN_HDR_LEN)
+        return fail(pkt, "truncated TCP header (snaplen too small?)");
+
+    struct tcp_hdr t;
+    memcpy(&t, p, sizeof t);
+
+    pkt->l4          = L4_TCP;
+    pkt->src_port    = ntohs(t.sport);
+    pkt->dst_port    = ntohs(t.dport);
+    pkt->tcp_seq     = ntohl(t.seq);
+    pkt->tcp_ack     = ntohl(t.ack);
+    pkt->tcp_flags   = t.flags;
+    pkt->tcp_window  = ntohs(t.window);
+    pkt->tcp_hdr_len = (t.data_off >> 4) * 4;
+
+    if (pkt->tcp_hdr_len < TCP_MIN_HDR_LEN)
+        return fail(pkt, "bad TCP header length (data offset < 5)");
+    if (pkt->tcp_hdr_len > wire)
+        return fail(pkt, "TCP header longer than the IP datagram");
+    if (pkt->tcp_hdr_len > cap)
+        return fail(pkt, "truncated TCP options");
+
+    set_payload(pkt, p, cap, wire, pkt->tcp_hdr_len);
+    return 0;
+}
+
+static int decode_udp(const uint8_t *p, uint32_t cap, uint32_t wire, packet_t *pkt)
+{
+    if (wire < UDP_HDR_LEN)
+        return fail(pkt, "IP datagram too short for a UDP header");
+    if (cap < UDP_HDR_LEN)
+        return fail(pkt, "truncated UDP header (snaplen too small?)");
+
+    struct udp_hdr u;
+    memcpy(&u, p, sizeof u);
+
+    pkt->l4       = L4_UDP;
+    pkt->src_port = ntohs(u.sport);
+    pkt->dst_port = ntohs(u.dport);
+    pkt->udp_len  = ntohs(u.length);
+
+    set_payload(pkt, p, cap, wire, UDP_HDR_LEN);
+
+    /* In the first fragment of a fragmented datagram, the UDP length covers
+     * the whole reassembled datagram, so it's legitimately bigger than this
+     * piece. Only sanity-check it for unfragmented packets. */
+    if (!pkt->more_fragments) {
+        if (pkt->udp_len < UDP_HDR_LEN || pkt->udp_len > wire)
+            return fail(pkt, "UDP length field disagrees with IP length");
+        set_payload(pkt, p, cap, pkt->udp_len, UDP_HDR_LEN);
+    }
+    return 0;
+}
+
+static int decode_icmp(const uint8_t *p, uint32_t cap, uint32_t wire, packet_t *pkt)
+{
+    if (wire < ICMP_HDR_LEN)
+        return fail(pkt, "IP datagram too short for an ICMP header");
+    if (cap < ICMP_HDR_LEN)
+        return fail(pkt, "truncated ICMP header (snaplen too small?)");
+
+    struct icmp_hdr ic;
+    memcpy(&ic, p, sizeof ic);
+
+    pkt->l4        = L4_ICMP;
+    pkt->icmp_type = ic.type;
+    pkt->icmp_code = ic.code;
+    if (ic.type == ICMP_ECHO_REQUEST || ic.type == ICMP_ECHO_REPLY) {
+        pkt->icmp_id  = ntohs(ic.id);
+        pkt->icmp_seq = ntohs(ic.seq);
+    }
+    /* For errors (unreachable, time exceeded) the payload is the IP header
+     * + first 8 bytes of the packet that triggered it. Decoding that is a
+     * later stage; for now it's just payload. */
+    set_payload(pkt, p, cap, wire, ICMP_HDR_LEN);
+    return 0;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -63,8 +167,36 @@ static int decode_ipv4(const uint8_t *p, uint32_t len, packet_t *pkt)
         return fail(pkt, "truncated IPv4 options");
     if (pkt->ip_total_len < hdr_len)
         return fail(pkt, "IPv4 total length smaller than header");
+    /* If nothing was cut off by snaplen, the datagram must fit in the frame. */
+    if (pkt->caplen == pkt->wirelen && pkt->ip_total_len > len)
+        return fail(pkt, "IPv4 total length larger than the frame");
 
-    return 0;
+    /* Where does the datagram end? Trust the IP total length, not the frame:
+     *  - Ethernet pads frames to 60 bytes, so a tiny packet arrives with
+     *    trailing zeros that are NOT payload.
+     *  - snaplen can cut the frame short, so we may hold less than that.  */
+    uint32_t wire = pkt->ip_total_len - hdr_len;
+    uint32_t cap  = len - hdr_len;
+    if (cap > wire)
+        cap = wire;
+    p += hdr_len;
+
+    /* Only the first fragment (offset 0) carries the TCP/UDP header. Later
+     * fragments are just a continuation of the payload. */
+    if (pkt->frag_offset != 0) {
+        set_payload(pkt, p, cap, wire, 0);
+        return 0;
+    }
+
+    switch (pkt->ip_proto) {
+    case IPPROTO_TCP:  return decode_tcp(p, cap, wire, pkt);
+    case IPPROTO_UDP:  return decode_udp(p, cap, wire, pkt);
+    case IPPROTO_ICMP: return decode_icmp(p, cap, wire, pkt);
+    default:
+        pkt->l4 = L4_OTHER;
+        set_payload(pkt, p, cap, wire, 0);
+        return 0;
+    }
 }
 
 /* ------------------------------------------------------------------------ */
