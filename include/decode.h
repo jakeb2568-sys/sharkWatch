@@ -4,8 +4,8 @@
  * Decoding and printing are kept separate on purpose: later stages (flow
  * tracking, detection) consume packet_t directly and never touch raw bytes.
  */
-#ifndef WIREWATCH_DECODE_H
-#define WIREWATCH_DECODE_H
+#ifndef SHARKWATCH_DECODE_H
+#define SHARKWATCH_DECODE_H
 
 #include <netinet/in.h>
 #include <pcap/pcap.h>

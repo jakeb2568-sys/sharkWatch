@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate deterministic sample captures for testing wirewatch.
+Generate deterministic sample captures for testing sharkwatch.
 
     pip install scapy
     python3 scripts/make_samples.py

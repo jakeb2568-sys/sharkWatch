@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Check wirewatch's decoding field-by-field against Wireshark's (tshark).
+Check sharkwatch's decoding field-by-field against Wireshark's (tshark).
 
-    python3 tests/verify_against_tshark.py ./wirewatch samples/*.pcap
+    python3 tests/verify_against_tshark.py ./sharkwatch samples/*.pcap
 
-For every packet, runs `wirewatch -T` and `tshark -T fields` on the same file
+For every packet, runs `sharkwatch -T` and `tshark -T fields` on the same file
 and compares IPs, protocol, TTL, ports, TCP flags/seq/ack/len, UDP length and
 ICMP type/code. Exits non-zero on any mismatch.
 """
@@ -31,7 +31,7 @@ def norm(v):
     return v
 
 
-def run_wirewatch(binary, pcap):
+def run_sharkwatch(binary, pcap):
     out = subprocess.run([binary, "-T", "-r", pcap], capture_output=True, text=True, check=True).stdout
     rows = {}
     for line in out.splitlines():
@@ -67,11 +67,11 @@ def run_tshark(pcap):
 
 
 def compare(binary, pcap):
-    ours, theirs = run_wirewatch(binary, pcap), run_tshark(pcap)
+    ours, theirs = run_sharkwatch(binary, pcap), run_tshark(pcap)
     mismatches = checked = 0
     print(f"== {pcap}: {len(ours)} packets")
     if ours.keys() != theirs.keys():
-        print(f"  packet count differs: wirewatch {len(ours)}, tshark {len(theirs)}")
+        print(f"  packet count differs: sharkwatch {len(ours)}, tshark {len(theirs)}")
         return 1
 
     for frame, w in ours.items():
@@ -79,7 +79,7 @@ def compare(binary, pcap):
         if w["error"]:
             # Malformed packets: we stop decoding at the first bad header,
             # tshark sometimes salvages more. Report side by side, don't diff.
-            print(f"  frame {frame:>3}: wirewatch flagged \"{w['error']}\""
+            print(f"  frame {frame:>3}: sharkwatch flagged \"{w['error']}\""
                   f"  | tshark: {t['expert'] or '(no warning)'}")
             continue
 
@@ -95,7 +95,7 @@ def compare(binary, pcap):
             checked += 1
             if w[c] != t[c]:
                 mismatches += 1
-                print(f"  frame {frame:>3}: {c:<12} wirewatch={w[c]!r:<18} tshark={t[c]!r}")
+                print(f"  frame {frame:>3}: {c:<12} sharkwatch={w[c]!r:<18} tshark={t[c]!r}")
 
     print(f"  {checked} fields compared, {mismatches} mismatches")
     return mismatches

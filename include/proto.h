@@ -11,8 +11,8 @@
  * (it crashes outright on some CPUs). Instead the decoder memcpy()s the bytes
  * into a local struct, which is always correctly aligned.
  */
-#ifndef WIREWATCH_PROTO_H
-#define WIREWATCH_PROTO_H
+#ifndef SHARKWATCH_PROTO_H
+#define SHARKWATCH_PROTO_H
 
 #include <stdint.h>
 

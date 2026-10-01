@@ -1,8 +1,8 @@
 /*
  * print.h - human-readable output for decoded packets.
  */
-#ifndef WIREWATCH_PRINT_H
-#define WIREWATCH_PRINT_H
+#ifndef SHARKWATCH_PRINT_H
+#define SHARKWATCH_PRINT_H
 
 #include "decode.h"
 

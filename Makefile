@@ -4,7 +4,7 @@ CFLAGS  ?= -O2 -g
 override CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Wshadow -Iinclude -D_DEFAULT_SOURCE
 LDLIBS  += -lpcap
 
-BIN  := wirewatch
+BIN  := sharkwatch
 SRC  := $(wildcard src/*.c)
 OBJ  := $(SRC:src/%.c=build/%.o)
 HDRS := $(wildcard include/*.h)

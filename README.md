@@ -1,4 +1,4 @@
-# wirewatch
+# sharkWatch
 
 A packet analyzer written in C on top of libpcap. It decodes Ethernet, VLAN,
 IPv4, TCP, UDP and ICMP headers by hand, prints a Wireshark-style summary per
@@ -7,7 +7,7 @@ packet, and is checked field-by-field against Wireshark's own dissectors.
 This is the base for a small network intrusion detector. See the [roadmap](#roadmap).
 
 ```
-$ ./wirewatch -r samples/basic.pcap
+$ ./sharkwatch -r samples/basic.pcap
     1   0.000000  192.168.1.10:53001 -> 192.168.1.1:53  UDP len=29
     2   0.012500  192.168.1.1:53 -> 192.168.1.10:53001  UDP len=56
     3   0.025000  192.168.1.10:51514 -> 93.184.216.34:80  TCP [SYN] seq=1000 win=64240 len=0
@@ -28,7 +28,7 @@ $ ./wirewatch -r samples/basic.pcap
 Malformed packets are flagged rather than crashing the parser or being misread:
 
 ```
-$ ./wirewatch -v -r samples/edge_cases.pcap
+$ ./sharkwatch -v -r samples/edge_cases.pcap
    10   0.112500  192.168.1.10 -> 93.184.216.34  TCP  [!] truncated TCP header (snaplen too small?)
                    eth 02:00:00:aa:aa:01 -> 02:00:00:bb:bb:01  ttl=64 id=0x0001 hdr=20  frame=54 (captured 44)
    11   0.125000  192.168.1.10 -> 93.184.216.34  UDP  [!] bad IPv4 header length (IHL < 5)
@@ -48,7 +48,7 @@ make
 ## Usage
 
 ```
-wirewatch (-r FILE | -i IFACE) [options] [BPF filter]
+sharkwatch (-r FILE | -i IFACE) [options] [BPF filter]
 
   -r FILE     read packets from a pcap/pcapng file
   -i IFACE    capture live from an interface (needs root/CAP_NET_RAW)
@@ -61,10 +61,10 @@ wirewatch (-r FILE | -i IFACE) [options] [BPF filter]
 Examples:
 
 ```sh
-./wirewatch -r capture.pcapng
-./wirewatch -r capture.pcapng tcp port 443          # BPF filter, same syntax as tcpdump
-sudo ./wirewatch -i eth0 -c 100 -v
-sudo ./wirewatch -i any not port 22                 # Linux "any" pseudo-interface
+./sharkwatch -r capture.pcapng
+./sharkwatch -r capture.pcapng tcp port 443          # BPF filter, same syntax as tcpdump
+sudo ./sharkwatch -i eth0 -c 100 -v
+sudo ./sharkwatch -i any not port 22                 # Linux "any" pseudo-interface
 ```
 
 Live capture stops cleanly on Ctrl-C and prints a summary including kernel drop counts.
@@ -105,7 +105,7 @@ A few design points worth calling out:
 
 ### Verified against Wireshark
 
-`make test` runs both `wirewatch -T` and `tshark -T fields` on each sample
+`make test` runs both `sharkwatch -T` and `tshark -T fields` on each sample
 capture and compares 13 fields per packet (IPs, protocol, TTL, ports, TCP
 flags/seq/ack/payload length, UDP length, ICMP type/code):
 
@@ -114,9 +114,9 @@ $ make test
 == samples/basic.pcap: 15 packets
   163 fields compared, 0 mismatches
 == samples/edge_cases.pcap: 12 packets
-  frame  10: wirewatch flagged "truncated TCP header (snaplen too small?)"  | tshark: (no warning)
-  frame  11: wirewatch flagged "bad IPv4 header length (IHL < 5)"  | tshark: Bogus IP header length (8, must be at least 20)
-  frame  12: wirewatch flagged "truncated Ethernet header"  | tshark: Malformed Packet (Exception occurred)
+  frame  10: sharkwatch flagged "truncated TCP header (snaplen too small?)"  | tshark: (no warning)
+  frame  11: sharkwatch flagged "bad IPv4 header length (IHL < 5)"  | tshark: Bogus IP header length (8, must be at least 20)
+  frame  12: sharkwatch flagged "truncated Ethernet header"  | tshark: Malformed Packet (Exception occurred)
   101 fields compared, 0 mismatches
 
 PASS
@@ -124,7 +124,7 @@ PASS
 
 The same check passes on live captures of real traffic, for both Ethernet and
 Linux-cooked link types (6,000+ fields). You can run it on any capture of your
-own: `python3 tests/verify_against_tshark.py ./wirewatch your.pcap`.
+own: `python3 tests/verify_against_tshark.py ./sharkwatch your.pcap`.
 
 ### Sample captures
 

@@ -1,5 +1,5 @@
 /*
- * wirewatch - a small packet analyzer built on libpcap.
+ * sharkWatch - a small packet analyzer built on libpcap.
  *
  * Reads packets from a live interface or a .pcap file, decodes them, and
  * prints one line per packet plus a summary at the end.
@@ -167,7 +167,7 @@ int main(int argc, char **argv)
     pcap_t *h = file ? pcap_open_offline(file, errbuf)
                      : pcap_open_live(iface, snaplen, 1, 1000, errbuf);
     if (!h) {
-        fprintf(stderr, "wirewatch: %s\n", errbuf);
+        fprintf(stderr, "sharkwatch: %s\n", errbuf);
         return EXIT_FAILURE;
     }
 
@@ -177,7 +177,7 @@ int main(int argc, char **argv)
         struct bpf_program prog;
         if (pcap_compile(h, &prog, filter, 1, PCAP_NETMASK_UNKNOWN) == -1 ||
             pcap_setfilter(h, &prog) == -1) {
-            fprintf(stderr, "wirewatch: bad filter '%s': %s\n", filter, pcap_geterr(h));
+            fprintf(stderr, "sharkwatch: bad filter '%s': %s\n", filter, pcap_geterr(h));
             status = EXIT_FAILURE;
             goto out;
         }
@@ -186,7 +186,7 @@ int main(int argc, char **argv)
 
     c.linktype = pcap_datalink(h);
     if (!decode_linktype_supported(c.linktype)) {
-        fprintf(stderr, "wirewatch: unsupported link type %s (%s)\n",
+        fprintf(stderr, "sharkwatch: unsupported link type %s (%s)\n",
                 pcap_datalink_val_to_name(c.linktype),
                 pcap_datalink_val_to_description(c.linktype));
         status = EXIT_FAILURE;
@@ -198,7 +198,7 @@ int main(int argc, char **argv)
     signal(SIGTERM, on_sigint);
 
     if (pcap_loop(h, max_packets, on_packet, (u_char *)&c) == PCAP_ERROR) {
-        fprintf(stderr, "wirewatch: %s\n", pcap_geterr(h));
+        fprintf(stderr, "sharkwatch: %s\n", pcap_geterr(h));
         status = EXIT_FAILURE;
     }
 
