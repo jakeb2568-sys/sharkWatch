@@ -123,7 +123,8 @@ PASS
 ```
 
 The same check passes on live captures of real traffic, for both Ethernet and
-Linux-cooked link types (6,000+ fields). You can run it on any capture of your
+Linux-cooked link types (6,000+ fields), and on an 11,000-packet home Wi-Fi
+capture recorded in Wireshark on Windows (139,762 fields, 0 mismatches). You can run it on any capture of your
 own: `python3 tests/verify_against_tshark.py ./sharkwatch your.pcap`.
 
 ### Sample captures

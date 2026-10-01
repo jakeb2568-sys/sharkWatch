@@ -2,3 +2,4 @@ build/
 sharkwatch
 *.o
 *.dSYM/
+captures/
