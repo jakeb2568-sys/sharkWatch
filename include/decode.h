@@ -7,6 +7,8 @@
 #ifndef SHARKWATCH_DECODE_H
 #define SHARKWATCH_DECODE_H
 
+#include "app.h"
+
 #include <netinet/in.h>
 #include <pcap/pcap.h>
 #include <stdbool.h>
@@ -20,7 +22,7 @@ typedef enum {
     L4_OTHER,       /* IPv4 carrying some other protocol (GRE, ESP, ...) */
 } l4_type_t;
 
-typedef struct {
+typedef struct packet {
     /* ---- frame ---- */
     struct timeval ts;
     uint32_t caplen;            /* bytes actually captured */
@@ -59,6 +61,9 @@ typedef struct {
     const uint8_t *payload;     /* points into the captured bytes */
     uint32_t payload_len;       /* length on the wire, per the IP/UDP lengths */
     uint32_t payload_caplen;    /* how much of it was actually captured */
+
+    /* ---- application layer (Stage 3) ---- */
+    app_t    app;
 
     /* ---- problems ---- */
     const char *error;          /* NULL if decoded cleanly, else a static message */

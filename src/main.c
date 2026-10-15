@@ -8,6 +8,7 @@
 #include "print.h"
 #include "proto.h"
 
+#include <arpa/inet.h>
 #include <pcap/pcap.h>
 #include <signal.h>
 #include <stdio.h>
@@ -16,10 +17,20 @@
 #include <unistd.h>
 
 #define DEFAULT_SNAPLEN 65535
+#define MAX_CREDS_LISTED 50
 
 struct stats {
     unsigned long long packets, bytes, ipv4, arp, ipv6, other_l3,
                        tcp, udp, icmp, other_l4, fragments, malformed;
+    unsigned long long dns_queries, dns_responses, http_requests,
+                       http_responses, tls_hellos, tls_sni, creds;
+};
+
+/* Cleartext credentials are listed again in the summary: in thousands of
+ * lines of output, those are the ones you most need to see. */
+struct cred_seen {
+    unsigned long long frame;
+    char text[600];
 };
 
 struct ctx {
@@ -29,6 +40,8 @@ struct ctx {
     bool have_t0;
     struct timeval t0;
     struct stats st;
+    struct cred_seen creds[MAX_CREDS_LISTED];
+    int ncreds;
 };
 
 static pcap_t *g_handle;   /* for the signal handler */
@@ -69,6 +82,35 @@ static void count(struct stats *st, const packet_t *pkt, int rc)
     } else if (pkt->ethertype) {
         st->other_l3++;
     }
+
+    switch (pkt->app.type) {
+    case APP_DNS:
+        if (pkt->app.dns_response) st->dns_responses++; else st->dns_queries++;
+        break;
+    case APP_HTTP_REQUEST:  st->http_requests++;  break;
+    case APP_HTTP_RESPONSE: st->http_responses++; break;
+    case APP_TLS_CLIENT_HELLO:
+        st->tls_hellos++;
+        if (pkt->app.tls_sni[0])
+            st->tls_sni++;
+        break;
+    default: break;
+    }
+    if (pkt->app.cred != CRED_NONE)
+        st->creds++;
+}
+
+static void remember_credential(struct ctx *c, const packet_t *pkt)
+{
+    if (pkt->app.cred == CRED_NONE || c->ncreds >= MAX_CREDS_LISTED)
+        return;
+    struct cred_seen *cs = &c->creds[c->ncreds++];
+    char what[512], s[INET_ADDRSTRLEN], d[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &pkt->src_ip, s, sizeof s);
+    inet_ntop(AF_INET, &pkt->dst_ip, d, sizeof d);
+    cs->frame = c->st.packets;
+    snprintf(cs->text, sizeof cs->text, "%s -> %s:%u  %s", s, d, pkt->dst_port,
+             format_credential(pkt, what, sizeof what));
 }
 
 static void on_packet(u_char *user, const struct pcap_pkthdr *hdr,
@@ -84,21 +126,35 @@ static void on_packet(u_char *user, const struct pcap_pkthdr *hdr,
 
     int rc = decode_packet(c->linktype, hdr, bytes, &pkt);
     count(&c->st, &pkt, rc);
+    remember_credential(c, &pkt);
     if (c->tsv)
         print_packet_tsv(stdout, &pkt, c->st.packets);
     else
         print_packet(stdout, &pkt, c->st.packets, seconds_since(&c->t0, &hdr->ts), c->verbose);
 }
 
-static void print_summary(FILE *out, const struct stats *s)
+static void print_summary(FILE *out, const struct ctx *c)
 {
+    const struct stats *s = &c->st;
     fprintf(out,
             "\n--- %llu packets, %llu bytes ---\n"
             "  IPv4 %llu  (TCP %llu, UDP %llu, ICMP %llu, other %llu; fragments %llu)\n"
             "  ARP %llu   IPv6 %llu   other L3 %llu\n"
+            "  DNS %llu queries / %llu responses   HTTP %llu requests / %llu responses\n"
+            "  TLS %llu ClientHellos (%llu with SNI)\n"
             "  malformed/truncated %llu\n",
             s->packets, s->bytes, s->ipv4, s->tcp, s->udp, s->icmp, s->other_l4,
-            s->fragments, s->arp, s->ipv6, s->other_l3, s->malformed);
+            s->fragments, s->arp, s->ipv6, s->other_l3,
+            s->dns_queries, s->dns_responses, s->http_requests, s->http_responses,
+            s->tls_hellos, s->tls_sni, s->malformed);
+
+    if (s->creds) {
+        fprintf(out, "\n  !! %llu cleartext credential(s) seen:\n", s->creds);
+        for (int i = 0; i < c->ncreds; i++)
+            fprintf(out, "     frame %-6llu %s\n", c->creds[i].frame, c->creds[i].text);
+        if (s->creds > (unsigned long long)c->ncreds)
+            fprintf(out, "     ... and %llu more\n", s->creds - (unsigned long long)c->ncreds);
+    }
 }
 
 static void usage(FILE *out, const char *prog)
@@ -112,6 +168,7 @@ static void usage(FILE *out, const char *prog)
             "  -s SNAPLEN  bytes to capture per packet (default %d)\n"
             "  -v          verbose: add an L2/L3 detail line per packet\n"
             "  -T          tab-separated fields instead (see print.h for columns)\n"
+            "  -P          show cleartext passwords instead of ******** \n"
             "  -h          show this help\n"
             "\n"
             "Anything after the options is a BPF filter, same syntax as\n"
@@ -143,7 +200,7 @@ int main(int argc, char **argv)
     int max_packets = -1, snaplen = DEFAULT_SNAPLEN, opt;
     struct ctx c = { 0 };
 
-    while ((opt = getopt(argc, argv, "r:i:c:s:vTh")) != -1) {
+    while ((opt = getopt(argc, argv, "r:i:c:s:vTPh")) != -1) {
         switch (opt) {
         case 'r': file = optarg; break;
         case 'i': iface = optarg; break;
@@ -151,6 +208,7 @@ int main(int argc, char **argv)
         case 's': snaplen = atoi(optarg); break;
         case 'v': c.verbose = true; break;
         case 'T': c.tsv = true; break;
+        case 'P': print_set_reveal_passwords(true); break;
         case 'h': usage(stdout, argv[0]); return EXIT_SUCCESS;
         default:  usage(stderr, argv[0]); return EXIT_FAILURE;
         }
@@ -203,7 +261,7 @@ int main(int argc, char **argv)
     }
 
     fflush(stdout);   /* so the summary lands after the packet lines when piped */
-    print_summary(stderr, &c.st);
+    print_summary(stderr, &c);
     if (iface) {
         struct pcap_stat ps;
         if (pcap_stats(h, &ps) == 0)

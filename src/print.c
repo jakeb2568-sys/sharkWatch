@@ -142,6 +142,151 @@ static void print_ipv4(FILE *out, const packet_t *pkt)
                 pkt->frag_offset, pkt->more_fragments ? " MF" : "");
 }
 
+
+/* ------------------------------------------------------------------------ */
+/* Application layer                                                        */
+/* ------------------------------------------------------------------------ */
+
+/* Passwords are masked unless the user asks (-P). Output gets pasted into
+ * tickets, chats and screenshots; secrets shouldn't ride along by default. */
+static bool g_reveal_passwords;
+
+void print_set_reveal_passwords(bool on)
+{
+    g_reveal_passwords = on;
+}
+
+static const char *secret(const char *s)
+{
+    if (!s[0])
+        return "";
+    return g_reveal_passwords ? s : "********";
+}
+
+static const char *dns_type_name(uint16_t t, char *buf, size_t n)
+{
+    switch (t) {
+    case 1:   return "A";
+    case 2:   return "NS";
+    case 5:   return "CNAME";
+    case 6:   return "SOA";
+    case 12:  return "PTR";
+    case 15:  return "MX";
+    case 16:  return "TXT";
+    case 28:  return "AAAA";
+    case 33:  return "SRV";
+    case 65:  return "HTTPS";
+    case 255: return "ANY";
+    default:  snprintf(buf, n, "TYPE%u", t); return buf;
+    }
+}
+
+static const char *dns_rcode_name(uint8_t r)
+{
+    switch (r) {
+    case 1:  return "FORMERR";
+    case 2:  return "SERVFAIL";
+    case 3:  return "NXDOMAIN";
+    case 4:  return "NOTIMP";
+    case 5:  return "REFUSED";
+    default: return "error";
+    }
+}
+
+static const char *app_proto_name(app_type_t t)
+{
+    switch (t) {
+    case APP_FTP:  return "FTP";
+    case APP_POP3: return "POP3";
+    case APP_IMAP: return "IMAP";
+    case APP_HTTP_REQUEST:
+    case APP_HTTP_RESPONSE: return "HTTP";
+    default: return "";
+    }
+}
+
+const char *format_credential(const packet_t *pkt, char *buf, size_t n)
+{
+    const app_t *a = &pkt->app;
+    const char *proto = app_proto_name(a->type);
+
+    switch (a->cred) {
+    case CRED_USER:
+        snprintf(buf, n, "%s username: %s", proto, a->cred_user);
+        break;
+    case CRED_PASS:
+        snprintf(buf, n, "%s password: %s", proto, secret(a->cred_pass));
+        break;
+    case CRED_USERPASS:
+        snprintf(buf, n, "%s%s login: %s / %s", proto,
+                 a->type == APP_HTTP_REQUEST ? " Basic" : "",
+                 a->cred_user, secret(a->cred_pass));
+        break;
+    default:
+        buf[0] = '\0';
+    }
+    return buf;
+}
+
+static void print_app(FILE *out, const packet_t *pkt)
+{
+    const app_t *a = &pkt->app;
+    char tbuf[16];
+
+    switch (a->type) {
+    case APP_NONE:
+        return;
+    case APP_DNS:
+        fprintf(out, "  DNS %s", a->dns_response ? "response" : "query");
+        if (a->dns_has_question)
+            fprintf(out, " %s %s", dns_type_name(a->dns_qtype, tbuf, sizeof tbuf), a->dns_qname);
+        if (a->dns_response) {
+            if (a->dns_rcode)
+                fprintf(out, " %s", dns_rcode_name(a->dns_rcode));
+            for (int i = 0; i < a->dns_addr_count; i++) {
+                char ip[INET_ADDRSTRLEN];
+                fprintf(out, "%s%s", i ? ", " : " -> ", ip_str(a->dns_addrs[i], ip));
+            }
+            if (!a->dns_addr_count && !a->dns_rcode)
+                fprintf(out, " (%u answer%s)", a->dns_answers, a->dns_answers == 1 ? "" : "s");
+        }
+        break;
+    case APP_HTTP_REQUEST:
+        fprintf(out, "  HTTP %s %s", a->http_method, a->http_uri);
+        if (a->http_host[0])
+            fprintf(out, "  Host: %s", a->http_host);
+        break;
+    case APP_HTTP_RESPONSE:
+        fprintf(out, "  HTTP %u %s", a->http_status, a->http_reason);
+        break;
+    case APP_TLS_CLIENT_HELLO:
+        fprintf(out, "  TLS ClientHello");
+        if (a->tls_sni[0])
+            fprintf(out, " SNI=%s", a->tls_sni);
+        if (a->tls_alpn[0])
+            fprintf(out, " ALPN=%s", a->tls_alpn);
+        if (a->tls_partial && !a->tls_sni[0])
+            fprintf(out, " (continues in next segment)");
+        break;
+    case APP_FTP:
+    case APP_POP3:
+    case APP_IMAP:
+        fprintf(out, "  %s %s", app_proto_name(a->type), a->cmd);
+        if (a->cred == CRED_PASS)
+            fprintf(out, " %s", secret(a->cred_pass));
+        else if (a->cred == CRED_USERPASS)
+            fprintf(out, " %s %s", a->cred_user, secret(a->cred_pass));
+        else if (a->cmd_arg[0])
+            fprintf(out, " %s", a->cmd_arg);
+        break;
+    }
+
+    if (a->cred == CRED_USERPASS && a->type == APP_HTTP_REQUEST)
+        fprintf(out, "  Basic auth %s / %s", a->cred_user, secret(a->cred_pass));
+    if (a->cred != CRED_NONE)
+        fprintf(out, "  [CLEARTEXT CREDENTIAL]");
+}
+
 void print_packet_tsv(FILE *out, const packet_t *pkt, uint64_t frame_no)
 {
     char s[INET_ADDRSTRLEN] = "", d[INET_ADDRSTRLEN] = "";
@@ -177,6 +322,35 @@ void print_packet_tsv(FILE *out, const packet_t *pkt, uint64_t frame_no)
     else
         fprintf(out, "\t\t");
 
+    /* application layer */
+    const app_t *a = &pkt->app;
+    if (a->type == APP_DNS) {
+        char ip[INET_ADDRSTRLEN] = "";
+        if (a->dns_addr_count)
+            ip_str(a->dns_addrs[0], ip);
+        fprintf(out, "\t%s\t", a->dns_has_question ? a->dns_qname : "");
+        if (a->dns_has_question)
+            fprintf(out, "%u", a->dns_qtype);
+        fprintf(out, "\t%d\t%u\t%s", a->dns_response, a->dns_answers, ip);
+    } else {
+        fprintf(out, "\t\t\t\t\t");
+    }
+
+    fprintf(out, "\t%s\t%s\t%s\t", a->http_method, a->http_uri, a->http_host);
+    if (a->type == APP_HTTP_RESPONSE)
+        fprintf(out, "%u", a->http_status);
+    if (a->type == APP_HTTP_REQUEST && a->cred == CRED_USERPASS)
+        fprintf(out, "\t%s:%s", a->cred_user, secret(a->cred_pass));
+    else
+        fputc('\t', out);
+
+    fprintf(out, "\t%s\t%s", a->tls_sni, a->tls_alpn);
+
+    const char *arg = a->cmd_arg;
+    if (a->cred == CRED_PASS || (a->type == APP_IMAP && a->cred == CRED_USERPASS))
+        arg = g_reveal_passwords ? a->cmd_arg : "********";
+    fprintf(out, "\t%s\t%s", a->cmd, a->cmd[0] ? arg : "");
+
     fprintf(out, "\t%s\n", pkt->error ? pkt->error : "");
 }
 
@@ -200,10 +374,12 @@ void print_packet(FILE *out, const packet_t *pkt, uint64_t frame_no,
 {
     fprintf(out, "%5llu %10.6f  ", (unsigned long long)frame_no, rel_time);
 
-    if (pkt->has_ipv4)
+    if (pkt->has_ipv4) {
         print_ipv4(out, pkt);
-    else if (pkt->ethertype || pkt->has_mac)
+        print_app(out, pkt);
+    } else if (pkt->ethertype || pkt->has_mac) {
         print_l2_only(out, pkt);
+    }
 
     if (pkt->error)
         fprintf(out, "  [!] %s", pkt->error);

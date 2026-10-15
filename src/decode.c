@@ -264,7 +264,11 @@ int decode_packet(int linktype, const struct pcap_pkthdr *hdr,
     }
 
     pkt->ethertype = ethertype;
-    if (ethertype == ETYPE_IPV4)
-        return decode_ipv4(p, len, pkt);
+    if (ethertype == ETYPE_IPV4) {
+        int rc = decode_ipv4(p, len, pkt);
+        if (rc == 0)
+            rc = decode_app(pkt);   /* headers were clean: look at the payload */
+        return rc;
+    }
     return 0;   /* ARP, IPv6, etc.: layer 2 only for now */
 }

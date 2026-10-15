@@ -1,39 +1,41 @@
 # sharkWatch
 
 A packet analyzer written in C on top of libpcap. It decodes Ethernet, VLAN,
-IPv4, TCP, UDP and ICMP headers by hand, prints a Wireshark-style summary per
-packet, and is checked field-by-field against Wireshark's own dissectors.
+IPv4, TCP, UDP and ICMP headers by hand, plus the application layer: DNS
+lookups, HTTP requests, the hostname inside TLS handshakes, and cleartext
+logins. Every field is checked against Wireshark's own dissectors.
 
 This is the base for a small network intrusion detector. See the [roadmap](#roadmap).
 
 ```
-$ ./sharkwatch -r samples/basic.pcap
-    1   0.000000  192.168.1.10:53001 -> 192.168.1.1:53  UDP len=29
-    2   0.012500  192.168.1.1:53 -> 192.168.1.10:53001  UDP len=56
-    3   0.025000  192.168.1.10:51514 -> 93.184.216.34:80  TCP [SYN] seq=1000 win=64240 len=0
-    4   0.037500  93.184.216.34:80 -> 192.168.1.10:51514  TCP [SYN, ACK] seq=5000 ack=1001 win=65535 len=0
-    5   0.050000  192.168.1.10:51514 -> 93.184.216.34:80  TCP [ACK] seq=1001 ack=5001 win=64240 len=0
-    6   0.062500  192.168.1.10:51514 -> 93.184.216.34:80  TCP [PSH, ACK] seq=1001 ack=5001 win=64240 len=37
+$ ./sharkwatch -r samples/app_layer.pcap
+    1   0.000000  192.168.1.10:50001 -> 192.168.1.1:53  UDP len=33  DNS query A www.example.com
+    2   0.012500  192.168.1.1:53 -> 192.168.1.10:50001  UDP len=127  DNS response A www.example.com -> 93.184.216.34, 93.184.216.35
+    4   0.037500  192.168.1.1:53 -> 192.168.1.10:50002  UDP len=30  DNS response AAAA nope.invalid NXDOMAIN
+    6   0.062500  192.168.1.10:51000 -> 10.0.0.80:80  TCP [PSH, ACK] ... len=112  HTTP GET /admin  Host: intranet.example  Basic auth alice / ********  [CLEARTEXT CREDENTIAL]
+    9   0.100000  10.0.0.80:8080 -> 192.168.1.10:51001  TCP [PSH, ACK] ... len=26  HTTP 404 Not Found
+   10   0.112500  192.168.1.10:51100 -> 93.184.216.34:443  TCP [PSH, ACK] ... len=517  TLS ClientHello SNI=www.example.com ALPN=h2
+   14   0.162500  192.168.1.10:51200 -> 10.0.0.21:21  TCP [PSH, ACK] ... len=12  FTP USER alice  [CLEARTEXT CREDENTIAL]
+   16   0.187500  192.168.1.10:51200 -> 10.0.0.21:21  TCP [PSH, ACK] ... len=14  FTP PASS ********  [CLEARTEXT CREDENTIAL]
+   22   0.262500  192.168.1.1:53 -> 192.168.1.10:50003  UDP len=18  DNS response (0 answers)  [!] DNS name compression loop
+   25   0.300000  192.168.1.10:50006 -> 192.168.1.1:53  UDP len=40  DNS query A \x1b[2Jgotcha.example.com
   ...
-   12   0.137500  192.168.1.10 -> 8.8.8.8  ICMP echo request id=0x0042 seq=1
-   13   0.150000  8.8.8.8 -> 192.168.1.10  ICMP echo reply id=0x0042 seq=1
-   14   0.162500  02:00:00:aa:aa:01 -> ff:ff:ff:ff:ff:ff  ARP
 
---- 15 packets, 916 bytes ---
-  IPv4 13  (TCP 9, UDP 2, ICMP 2, other 0; fragments 0)
-  ARP 2   IPv6 0   other L3 0
-  malformed/truncated 0
+--- 26 packets, 3187 bytes ---
+  IPv4 26  (TCP 16, UDP 10, ICMP 0, other 0; fragments 0)
+  ARP 0   IPv6 0   other L3 0
+  DNS 3 queries / 6 responses   HTTP 2 requests / 2 responses
+  TLS 2 ClientHellos (1 with SNI)
+  malformed/truncated 4
+
+  !! 6 cleartext credential(s) seen:
+     frame 6      192.168.1.10 -> 10.0.0.80:80  HTTP Basic login: alice / ********
+     frame 14     192.168.1.10 -> 10.0.0.21:21  FTP username: alice
+     frame 16     192.168.1.10 -> 10.0.0.21:21  FTP password: ********
+     ...
 ```
 
-Malformed packets are flagged rather than crashing the parser or being misread:
-
-```
-$ ./sharkwatch -v -r samples/edge_cases.pcap
-   10   0.112500  192.168.1.10 -> 93.184.216.34  TCP  [!] truncated TCP header (snaplen too small?)
-                   eth 02:00:00:aa:aa:01 -> 02:00:00:bb:bb:01  ttl=64 id=0x0001 hdr=20  frame=54 (captured 44)
-   11   0.125000  192.168.1.10 -> 93.184.216.34  UDP  [!] bad IPv4 header length (IHL < 5)
-                   eth 02:00:00:aa:aa:01 -> 02:00:00:bb:bb:01  ttl=64 id=0x0001 hdr=8  frame=42
-```
+(All credentials in the sample captures are fake.)
 
 ## Build
 
@@ -56,6 +58,7 @@ sharkwatch (-r FILE | -i IFACE) [options] [BPF filter]
   -s SNAPLEN  bytes to capture per packet (default 65535)
   -v          verbose: add an L2/L3 detail line per packet
   -T          tab-separated fields instead (for scripts / diffing)
+  -P          show cleartext passwords instead of ********
 ```
 
 Examples:
@@ -63,27 +66,42 @@ Examples:
 ```sh
 ./sharkwatch -r capture.pcapng
 ./sharkwatch -r capture.pcapng tcp port 443          # BPF filter, same syntax as tcpdump
+./sharkwatch -r capture.pcapng udp port 53           # every DNS lookup
+./sharkwatch -r capture.pcapng > /dev/null           # summary only, incl. credentials seen
 sudo ./sharkwatch -i eth0 -c 100 -v
 sudo ./sharkwatch -i any not port 22                 # Linux "any" pseudo-interface
 ```
 
 Live capture stops cleanly on Ctrl-C and prints a summary including kernel drop counts.
 
+## What it decodes
+
+| Layer | Protocols |
+|---|---|
+| Link | Ethernet II, 802.1Q / Q-in-Q VLAN tags, Linux cooked capture v1/v2 |
+| Network | IPv4 (options, fragments). ARP and IPv6 are labelled. |
+| Transport | TCP (flags, seq/ack, options length), UDP, ICMP |
+| Application | **DNS / mDNS / LLMNR**: question, answer count, A records, error codes |
+| | **HTTP/1.x**: method, URI, Host, status; detected by content on any port |
+| | **TLS**: Server Name Indication (SNI) and ALPN from the ClientHello |
+| | **Cleartext logins**: FTP and POP3 `USER`/`PASS`, IMAP `LOGIN`, HTTP Basic auth |
+
 ## How it works
 
 ```
 pcap_loop ─▶ decode_packet() ─▶ packet_t ─▶ print_packet() / print_packet_tsv()
               │
-              ├─ link layer:  Ethernet II (+802.1Q / Q-in-Q), Linux cooked v1/v2
-              ├─ network:     IPv4 (options, fragments)
-              └─ transport:   TCP (flags, options length), UDP, ICMP
+              ├─ link layer:   Ethernet II (+802.1Q / Q-in-Q), Linux cooked v1/v2
+              ├─ network:      IPv4 (options, fragments)
+              ├─ transport:    TCP, UDP, ICMP                        (decode.c)
+              └─ application:  DNS, HTTP, TLS ClientHello, FTP/POP3/IMAP  (app.c)
 ```
 
-Decoding and printing are separate. `decode.c` fills a `packet_t` struct and
-never prints anything, so later stages (flow tracking, detection) can use
+Decoding and printing are separate. The decoders fill a `packet_t` struct and
+never print anything, so later stages (flow tracking, detection) can use
 decoded packets without touching raw bytes.
 
-A few design points worth calling out:
+### Header parsing
 
 - **No pointer casts onto packet memory.** The IPv4 header starts 14 bytes into
   an Ethernet frame, so it isn't 4-byte aligned, and reading a misaligned
@@ -101,31 +119,93 @@ A few design points worth calling out:
   TCP/UDP header. Later fragments are reported as continuation data, not
   misparsed as a transport header.
 
+### Application layer: treating payloads as hostile
+
+Whoever sends a packet controls every byte of its payload, so `app.c` assumes
+the worst:
+
+- **DNS compression loops are capped.** DNS names can contain "pointers" back
+  to earlier parts of the message. A malicious packet can point a name at
+  itself, and a naive decoder then loops forever. sharkwatch limits the number
+  of pointer jumps and the total name length, and reports
+  `DNS name compression loop` instead of hanging. (Wireshark gives no warning at
+  all on the self-pointing case in `samples/app_layer.pcap`.)
+- **Every extracted string is sanitized before printing.** A DNS name or HTTP
+  header can contain terminal escape codes. `ESC[2J`, for example, clears the
+  screen of whoever is reading the output. Non-printable bytes are shown as
+  `\xNN` escapes, so `\x1b[2Jgotcha.example.com` is displayed as text instead of
+  being executed by the terminal. Fuzzing confirmed that no raw control bytes
+  ever reach the output.
+- **Fixed-size buffers, length-bounded copies.** No string is assumed to be
+  NUL-terminated, and every copy is truncated to its buffer.
+- **Passwords are masked by default.** Output tends to end up in tickets,
+  chats and screenshots, so passwords print as `********` unless you pass `-P`.
+
+### Why HTTPS still leaks hostnames
+
+TLS encrypts everything after the handshake, but the client's first message
+(the ClientHello) is plaintext. It usually carries the **Server Name
+Indication**, the hostname the client wants, so the server knows which
+certificate to send. That's why sharkwatch can show `SNI=pypi.org` for a
+connection whose contents it can't read. Encrypted Client Hello (ECH) closes
+this gap where it's deployed.
+
+### Known limits
+
+- **One packet at a time.** A message split across several TCP segments is
+  decoded only from the segment that contains its start. This matters for
+  large modern ClientHellos (post-quantum key shares push them past one segment),
+  which are reported as `(continues in next segment)` when the SNI isn't in the
+  first part. TCP stream reassembly arrives with flow tracking in Stage 4.
+- FTP/POP3 usernames and passwords arrive in separate packets and are listed
+  separately. Pairing them per connection is also a Stage 4 job.
+- DNS over HTTPS and QUIC (HTTP/3) are encrypted, so their lookups and hostnames
+  aren't visible here.
+
 ## Testing
 
 ### Verified against Wireshark
 
 `make test` runs both `sharkwatch -T` and `tshark -T fields` on each sample
-capture and compares 13 fields per packet (IPs, protocol, TTL, ports, TCP
-flags/seq/ack/payload length, UDP length, ICMP type/code):
+capture and compares, packet by packet:
+
+- **Headers:** IPs, protocol, TTL, ports, TCP flags/seq/ack/payload length, UDP
+  length, ICMP type/code
+- **DNS:** question name and type, response flag, answer count, first A record
+- **HTTP:** method, URI, Host, status code, Basic auth
+- **TLS:** SNI, ALPN
+- **FTP/POP3:** command and argument
 
 ```
 $ make test
+== samples/app_layer.pcap: 26 packets
+  frame  22: sharkwatch flagged "DNS name compression loop"  | tshark: (no warning)
+  frame  23: sharkwatch flagged "DNS name compression loop"  | tshark: Extraneous data
+  frame  24: sharkwatch flagged "truncated DNS name"  | tshark: Malformed Packet (Exception occurred)
+  frame  26: sharkwatch flagged "truncated DNS header"  | tshark: Malformed Packet (Exception occurred)
+  352 fields compared, 0 mismatches
 == samples/basic.pcap: 15 packets
-  163 fields compared, 0 mismatches
+  218 fields compared, 0 mismatches
 == samples/edge_cases.pcap: 12 packets
-  frame  10: sharkwatch flagged "truncated TCP header (snaplen too small?)"  | tshark: (no warning)
-  frame  11: sharkwatch flagged "bad IPv4 header length (IHL < 5)"  | tshark: Bogus IP header length (8, must be at least 20)
-  frame  12: sharkwatch flagged "truncated Ethernet header"  | tshark: Malformed Packet (Exception occurred)
-  101 fields compared, 0 mismatches
+  ...
+  92 fields compared, 0 mismatches
 
 PASS
 ```
 
-The same check passes on live captures of real traffic, for both Ethernet and
-Linux-cooked link types (6,000+ fields), and on an 11,000-packet home Wi-Fi
-capture recorded in Wireshark on Windows (139,762 fields, 0 mismatches). You can run it on any capture of your
-own: `python3 tests/verify_against_tshark.py ./sharkwatch your.pcap`.
+On real traffic, the comparison passes with 0 mismatches on:
+
+- **An 11,000-packet home Wi-Fi capture** recorded in Wireshark on Windows
+  (139,762 fields).
+- **8,000+ packets of live traffic** covering real TLS handshakes from curl,
+  OpenSSL and Python, real DNS answers, and HTTP with Basic auth (122,867 fields).
+
+You can run it on any capture of your own:
+`python3 tests/verify_against_tshark.py ./sharkwatch your.pcap`.
+
+The test also has to be able to fail. Planting bugs confirms that it does: a
+missing `ntohs()` on a port, an SNI copied one byte short, and a skipped DNS
+answer are each caught immediately.
 
 ### Sample captures
 
@@ -133,7 +213,7 @@ own: `python3 tests/verify_against_tshark.py ./sharkwatch your.pcap`.
 
 - **`basic.pcap`**: a DNS lookup, a full TCP handshake, an HTTP exchange and
   teardown, a ping, and ARP.
-- **`edge_cases.pcap`**: packets designed to break a careless parser:
+- **`edge_cases.pcap`**: packets designed to break a careless header parser:
   - Ethernet padding
   - a VLAN tag
   - IP and TCP options
@@ -143,21 +223,34 @@ own: `python3 tests/verify_against_tshark.py ./sharkwatch your.pcap`.
   - a snaplen-truncated frame
   - a bogus IHL
   - a 10-byte runt frame
+- **`app_layer.pcap`**: application traffic:
+  - DNS with CNAME and multiple A records, an NXDOMAIN, and an mDNS announcement
+  - HTTP with Basic auth, and HTTP on port 8080
+  - real OpenSSL ClientHellos, including one split across two segments
+  - FTP, POP3 and IMAP logins
+  - hostile DNS: self-pointing and mutually-pointing compression loops, a lying
+    answer count, a terminal escape sequence in a name, and a runt header
 
 ### Fuzzing
 
 `make sanitize` builds with AddressSanitizer and UndefinedBehaviorSanitizer.
-That build was run against 20,000 randomly corrupted packets: bit flips,
-truncations, bad header lengths, and wire lengths that don't match. Result: no
-memory errors and no undefined behavior.
+That build was run against about 70,000 randomly corrupted packets:
+
+- **20,000 aimed at the header parsers:** bit flips, truncations, bad header
+  lengths, and wire lengths that don't match.
+- **50,000 aimed at the application parsers:** corrupted DNS/TLS/HTTP payloads,
+  forged length fields and compression pointers.
+
+Result: no memory errors, no undefined behavior, and no raw control characters
+in 60,000+ lines of output from hostile input.
 
 ## Roadmap
 
 - [x] **Stage 0**: open live/offline captures with libpcap
 - [x] **Stage 1**: Ethernet, VLAN, Linux cooked and IPv4 decoding
 - [x] **Stage 2**: TCP / UDP / ICMP decoding, tshark verification, fuzzing
-- [ ] **Stage 3**: application layer: DNS names, HTTP request lines, cleartext credentials
-- [ ] **Stage 4**: per-flow state tracking (hash table of connections)
+- [x] **Stage 3**: application layer: DNS, HTTP, TLS SNI, cleartext credentials
+- [ ] **Stage 4**: per-flow state tracking (hash table of connections), TCP reassembly
 - [ ] **Stage 5**: detection: port scans, SYN floods, ARP spoofing
 
 ## Layout
@@ -165,7 +258,9 @@ memory errors and no undefined behavior.
 ```
 include/proto.h    on-the-wire header structs and constants
 include/decode.h   packet_t, the decoded representation
+include/app.h      application-layer fields (DNS, HTTP, TLS, credentials)
 src/decode.c       link / network / transport decoders
+src/app.c          application-layer decoders
 src/print.c        human-readable and TSV output
 src/main.c         CLI, capture loop, stats
 scripts/           sample capture generator

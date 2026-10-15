@@ -5,10 +5,16 @@ Generate deterministic sample captures for testing sharkwatch.
     pip install scapy
     python3 scripts/make_samples.py
 
-Writes samples/basic.pcap (normal traffic) and samples/edge_cases.pcap
-(packets designed to trip up a careless parser). All traffic is synthetic,
-no network access needed.
+Writes:
+  samples/basic.pcap       normal traffic
+  samples/edge_cases.pcap  packets designed to trip up a careless header parser
+  samples/app_layer.pcap   DNS, HTTP, TLS and plaintext logins, plus hostile
+                           application data (DNS compression loops, escape codes)
+
+All traffic is synthetic and the credentials are fake; no network access needed.
 """
+import ssl
+import struct
 from pathlib import Path
 
 from scapy.all import (ARP, DNS, DNSQR, DNSRR, ICMP, IP, IPv6, TCP, UDP,
@@ -106,8 +112,108 @@ def edge_cases():
     return pkts
 
 
+def tls_client_hello(sni, alpn):
+    """A real ClientHello produced by this machine's OpenSSL, without any network:
+    the TLS engine writes into an in-memory buffer instead of a socket."""
+    ctx = ssl.create_default_context()
+    ctx.set_alpn_protocols(alpn)
+    incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+    tls = ctx.wrap_bio(incoming, outgoing, server_hostname=sni)
+    try:
+        tls.do_handshake()
+    except ssl.SSLWantReadError:
+        pass  # waiting for a ServerHello that will never come; we only want the hello
+    return outgoing.read()
+
+
+def dns_raw(txid, flags, qd, an, body):
+    return struct.pack("!HHHHHH", txid, flags, qd, an, 0, 0) + body
+
+
+def app_layer():
+    MAIL, FTP_SRV, WEB = "10.0.0.25", "10.0.0.21", "10.0.0.80"
+    seqs = {}
+
+    def tcp(src, dst, sport, dport, payload, flags="PA"):
+        key = (src, sport, dst, dport)
+        seq = seqs.get(key, 1000)
+        seqs[key] = seq + len(payload)
+        return eth() / IP(src=src, dst=dst) / TCP(sport=sport, dport=dport, flags=flags,
+                                                  seq=seq, ack=1, window=64240) / Raw(payload)
+
+    def udp(src, dst, sport, dport, payload):
+        return eth() / IP(src=src, dst=dst) / UDP(sport=sport, dport=dport) / Raw(payload)
+
+    pkts = []
+
+    # --- DNS --------------------------------------------------------------
+    pkts.append(eth() / IP(src=CLIENT, dst=DNS_SRV) / UDP(sport=50001, dport=53)
+                / DNS(id=0x1111, rd=1, qd=DNSQR(qname="www.example.com", qtype="A")))
+    pkts.append(eth(ROUTER_MAC, CLIENT_MAC) / IP(src=DNS_SRV, dst=CLIENT) / UDP(sport=53, dport=50001)
+                / DNS(id=0x1111, qr=1, rd=1, ra=1, qd=DNSQR(qname="www.example.com", qtype="A"),
+                      an=[DNSRR(rrname="www.example.com", type="CNAME", rdata="example.com", ttl=60),
+                          DNSRR(rrname="example.com", type="A", rdata="93.184.216.34", ttl=60),
+                          DNSRR(rrname="example.com", type="A", rdata="93.184.216.35", ttl=60)]))
+    pkts.append(eth() / IP(src=CLIENT, dst=DNS_SRV) / UDP(sport=50002, dport=53)
+                / DNS(id=0x2222, rd=1, qd=DNSQR(qname="nope.invalid", qtype="AAAA")))
+    pkts.append(eth(ROUTER_MAC, CLIENT_MAC) / IP(src=DNS_SRV, dst=CLIENT) / UDP(sport=53, dport=50002)
+                / DNS(id=0x2222, qr=1, rd=1, ra=1, rcode=3, qd=DNSQR(qname="nope.invalid", qtype="AAAA")))
+    # mDNS announcement: a response with answers but no question section
+    pkts.append(eth() / IP(src=CLIENT, dst="224.0.0.251", ttl=255) / UDP(sport=5353, dport=5353)
+                / DNS(id=0, qr=1, aa=1, qd=[], an=[DNSRR(rrname="_http._tcp.local", type="PTR",
+                                                       rdata="Office Printer._http._tcp.local", ttl=120)]))
+
+    # --- HTTP -------------------------------------------------------------
+    pkts.append(tcp(CLIENT, WEB, 51000, 80,
+                    b"GET /admin HTTP/1.1\r\nHost: intranet.example\r\nUser-Agent: curl/8.5\r\n"
+                    b"Authorization: Basic YWxpY2U6aHVudGVyMg==\r\n\r\n"))       # alice:hunter2
+    pkts.append(tcp(WEB, CLIENT, 80, 51000, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
+    pkts.append(tcp(CLIENT, WEB, 51001, 8080,
+                    b"POST /api/v1/items?id=7 HTTP/1.1\r\nHost: 10.0.0.80:8080\r\n"
+                    b"Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"))
+    pkts.append(tcp(WEB, CLIENT, 8080, 51001, b"HTTP/1.1 404 Not Found\r\n\r\n"))
+
+    # --- TLS --------------------------------------------------------------
+    hello = tls_client_hello("www.example.com", ["h2", "http/1.1"])
+    pkts.append(tcp(CLIENT, SERVER, 51100, 443, hello))
+    # The same kind of hello split across two TCP segments, as happens with
+    # large modern hellos: the SNI isn't in the first segment.
+    hello2 = tls_client_hello("mail.example.org", ["http/1.1"])
+    pkts.append(tcp(CLIENT, SERVER, 51101, 443, hello2[:120]))
+    pkts.append(tcp(CLIENT, SERVER, 51101, 443, hello2[120:]))
+
+    # --- Plaintext logins (fake credentials) ----------------------------
+    pkts.append(tcp(FTP_SRV, CLIENT, 21, 51200, b"220 ProFTPD Server ready\r\n"))
+    pkts.append(tcp(CLIENT, FTP_SRV, 51200, 21, b"USER alice\r\n"))
+    pkts.append(tcp(FTP_SRV, CLIENT, 21, 51200, b"331 Password required for alice\r\n"))
+    pkts.append(tcp(CLIENT, FTP_SRV, 51200, 21, b"PASS hunter2\r\n"))
+    pkts.append(tcp(FTP_SRV, CLIENT, 21, 51200, b"230 User alice logged in\r\n"))
+    pkts.append(tcp(CLIENT, FTP_SRV, 51200, 21, b"RETR payroll.xlsx\r\n"))
+    pkts.append(tcp(CLIENT, MAIL, 51300, 110, b"USER bob\r\n"))
+    pkts.append(tcp(CLIENT, MAIL, 51300, 110, b"PASS pop-secret\r\n"))
+    pkts.append(tcp(CLIENT, MAIL, 51301, 143, b'a001 LOGIN carol "correct horse"\r\n'))
+
+    # --- Hostile application data ---------------------------------------
+    # DNS name that is a compression pointer to itself (offset 12): infinite loop bait
+    pkts.append(udp(DNS_SRV, CLIENT, 53, 50003,
+                    dns_raw(0x3333, 0x8180, 1, 0, b"\xc0\x0c" + b"\x00\x01\x00\x01")))
+    # Two pointers pointing at each other
+    pkts.append(udp(DNS_SRV, CLIENT, 53, 50004,
+                    dns_raw(0x4444, 0x8180, 1, 0, b"\xc0\x0e\xc0\x0c" + b"\x00\x01\x00\x01")))
+    # Answer count of 50 with no answers present
+    pkts.append(udp(DNS_SRV, CLIENT, 53, 50005,
+                    dns_raw(0x5555, 0x8180, 0, 50, b"")))
+    # Name containing a terminal escape sequence (ESC[2J clears the screen)
+    pkts.append(eth() / IP(src=CLIENT, dst=DNS_SRV) / UDP(sport=50006, dport=53)
+                / DNS(id=0x6666, rd=1, qd=DNSQR(qname=b"\x1b[2Jgotcha.example.com")))
+    # 8 bytes on port 53: too short for a DNS header
+    pkts.append(udp(CLIENT, DNS_SRV, 50007, 53, b"\x00\x01\x02\x03\x04\x05\x06\x07"))
+    return pkts
+
+
 if __name__ == "__main__":
     OUT.mkdir(exist_ok=True)
     write(OUT / "basic.pcap", basic(), start=1_700_000_000.0)
     write(OUT / "edge_cases.pcap", edge_cases(), start=1_700_000_100.0)
-    print(f"wrote {OUT/'basic.pcap'} and {OUT/'edge_cases.pcap'}")
+    write(OUT / "app_layer.pcap", app_layer(), start=1_700_000_200.0)
+    print(f"wrote basic.pcap, edge_cases.pcap and app_layer.pcap to {OUT}")
