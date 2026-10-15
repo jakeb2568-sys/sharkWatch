@@ -189,6 +189,11 @@ def app_layer():
     pkts.append(tcp(CLIENT, SERVER, 51102, 443, hello3[:cut]))
     pkts.append(tcp(CLIENT, SERVER, 51102, 443, hello3[cut:]))
 
+    # TLS 1.3 HelloRetryRequest: the client's second hello arrives behind a
+    # dummy ChangeCipherSpec record in the same segment (RFC 8446 D.4).
+    retry = tls_client_hello("cdn.example.com", ["h2"])
+    pkts.append(tcp(CLIENT, SERVER, 51103, 443, b"\x14\x03\x03\x00\x01\x01" + retry))
+
     # --- Non-ASCII names ---------------------------------------------------
     # Valid UTF-8 (a curly apostrophe) should display as-is...
     pkts.append(eth() / IP(src=CLIENT, dst="224.0.0.251", ttl=255) / UDP(sport=5353, dport=5353)

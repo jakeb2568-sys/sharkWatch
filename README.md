@@ -161,6 +161,14 @@ certificate to send. That's why sharkwatch can show `SNI=pypi.org` for a
 connection whose contents it can't read. Encrypted Client Hello (ECH) closes
 this gap where it's deployed.
 
+A TCP segment can hold several TLS records, so sharkwatch doesn't assume the
+hello is the first byte. When a TLS 1.3 server rejects the client's key type
+with a **HelloRetryRequest**, the client sends a second ClientHello, and in
+"middlebox compatibility mode" it puts a dummy ChangeCipherSpec record in
+front of it, in the same segment. sharkwatch skips those records and labels
+the result `(retry after HelloRetryRequest)`. Steam's client was caught doing
+this in a real home capture, which is how this case was found.
+
 ### Known limits
 
 - **One packet at a time.** A message split across several TCP segments is
@@ -214,8 +222,10 @@ On real traffic, the comparison passes with 0 mismatches on:
 You can run it on any capture of your own:
 `python3 tests/verify_against_tshark.py ./sharkwatch your.pcap`.
 
-ClientHellos split across TCP segments (common with browsers) are counted and
-reported separately rather than compared. Without stream reassembly, sharkwatch
+TLS fields are compared on client-to-server packets only. sharkwatch decodes
+the ClientHello, while in TLS 1.2 tshark also reports the server's chosen ALPN
+from the ServerHello. ClientHellos split across TCP segments (common with
+browsers) are counted and reported separately rather than compared. Without stream reassembly, sharkwatch
 and Wireshark recover different parts of the pieces, so there's nothing
 meaningful to diff until Stage 4.
 
@@ -249,6 +259,7 @@ answer are each caught immediately.
   - real OpenSSL ClientHellos, including one split across two segments
   - FTP, POP3 and IMAP logins
   - a ClientHello split *after* its SNI, as large browser hellos are
+  - a retried ClientHello behind a ChangeCipherSpec record (HelloRetryRequest)
   - mDNS names with a curly apostrophe and a bidi-override character
   - hostile DNS: self-pointing and mutually-pointing compression loops, a lying
     answer count, a terminal escape sequence in a name, and a runt header

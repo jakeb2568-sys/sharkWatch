@@ -151,7 +151,10 @@ def columns_to_check(w):
                 # decode one packet at a time (until Stage 4), so only compare
                 # the URI on the request itself.
                 cols.remove("http.uri")
-        if ports & TLS_PORTS:
+        if w["dstport"] in TLS_PORTS:
+            # Client -> server only: we decode the ClientHello. In TLS 1.2 the
+            # server's reply (ServerHello) also carries the chosen ALPN in
+            # plaintext, which tshark reports and we deliberately don't.
             cols += TLS_COLUMNS
         if w["dstport"] in ("21", "110"):
             cols += CMD_COLUMNS

@@ -267,6 +267,8 @@ static void print_app(FILE *out, const packet_t *pkt)
             fprintf(out, " ALPN=%s", a->tls_alpn);
         if (a->tls_partial && !a->tls_sni[0])
             fprintf(out, " (continues in next segment)");
+        if (a->tls_retry)
+            fprintf(out, " (retry after HelloRetryRequest)");
         break;
     case APP_FTP:
     case APP_POP3:

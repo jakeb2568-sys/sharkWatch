@@ -64,6 +64,7 @@ typedef struct {
     char     tls_sni[APP_STR_MAX];          /* Server Name Indication */
     char     tls_alpn[32];                  /* first ALPN protocol offered */
     bool     tls_partial;                   /* hello continues in a later segment */
+    bool     tls_retry;                     /* second hello, after a HelloRetryRequest */
 
     /* FTP / POP3 / IMAP command line */
     char     cmd[16];

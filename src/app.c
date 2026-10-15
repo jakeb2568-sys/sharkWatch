@@ -433,6 +433,7 @@ static int decode_http_response(packet_t *pkt, const uint8_t *p, size_t n)
 /* the site being visited. That's why HTTPS still leaks hostnames.          */
 /* ------------------------------------------------------------------------ */
 
+#define TLS_CONTENT_CCS       0x14   /* ChangeCipherSpec */
 #define TLS_CONTENT_HANDSHAKE 0x16
 #define TLS_HS_CLIENT_HELLO   0x01
 #define TLS_EXT_SERVER_NAME   0
@@ -606,9 +607,24 @@ int decode_app(packet_t *pkt)
         return 0;
 
     /* HTTP and TLS are recognised by their content, so they're found on any
-     * port. (A web server on an odd port is itself worth noticing.) */
-    if (looks_like_client_hello(p, n))
-        return decode_tls_client_hello(pkt, p, n);
+     * port. (A web server on an odd port is itself worth noticing.)
+     *
+     * One TCP segment can carry several TLS records. In TLS 1.3, when the
+     * server answers the first hello with a HelloRetryRequest ("use a
+     * different key type"), the client sends a dummy ChangeCipherSpec record
+     * ("middlebox compatibility mode", RFC 8446 appendix D.4) and then its
+     * second ClientHello, in the same segment. Skip those CCS records. */
+    size_t skip = 0;
+    while (n - skip >= 6 && p[skip] == TLS_CONTENT_CCS && p[skip + 1] == 0x03) {
+        size_t rec = 5 + (size_t)rd16(p + skip + 3);
+        if (rec > n - skip)
+            break;
+        skip += rec;
+    }
+    if (looks_like_client_hello(p + skip, n - skip)) {
+        pkt->app.tls_retry = skip > 0;
+        return decode_tls_client_hello(pkt, p + skip, n - skip);
+    }
     if (looks_like_http_request(p, n))
         return decode_http_request(pkt, p, n);
     if (starts_with(p, n, "HTTP/1."))
