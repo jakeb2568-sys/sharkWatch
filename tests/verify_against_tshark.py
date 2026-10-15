@@ -59,8 +59,11 @@ C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13}
 
 
 def tshark_escapes_to_hex(v):
-    """Wireshark shows unprintable bytes as C escapes (\\033, \\t); we show
-    \\x1b, \\x09. Same bytes, different spelling: convert theirs to ours."""
+    """Wireshark shows unprintable bytes as escapes, and the spelling depends on
+    the version: 4.2 prints ESC as \\033; 4.6 prints \\x1b and then escapes the
+    backslash itself in -T fields output (\\\\x1b). We print \\x1b. Convert
+    theirs to ours so only real differences count."""
+    v = v.replace("\\\\", "\\")                     # 4.6: \\x1b -> \x1b
     v = re.sub(r"\\([0-7]{3})", lambda m: "\\x%02x" % int(m.group(1), 8), v)
     return re.sub(r"\\([abtnvfr])", lambda m: "\\x%02x" % C_ESCAPES[m.group(1)], v)
 
@@ -123,6 +126,12 @@ def columns_to_check(w):
     if w["ip.proto"] == "6":
         if ports & HTTP_PORTS:
             cols += HTTP_COLUMNS
+            if not w["http.method"]:
+                # Newer Wireshark (4.6+) matches each response to its request
+                # and repeats the request's URI on the response packet. We
+                # decode one packet at a time (until Stage 4), so only compare
+                # the URI on the request itself.
+                cols.remove("http.uri")
         if ports & TLS_PORTS:
             cols += TLS_COLUMNS
         if w["dstport"] in ("21", "110"):
