@@ -344,7 +344,9 @@ void print_packet_tsv(FILE *out, const packet_t *pkt, uint64_t frame_no)
     else
         fputc('\t', out);
 
-    fprintf(out, "\t%s\t%s", a->tls_sni, a->tls_alpn);
+    fprintf(out, "\t%s\t%s\t", a->tls_sni, a->tls_alpn);
+    if (a->type == APP_TLS_CLIENT_HELLO)
+        fputc(a->tls_partial ? '1' : '0', out);
 
     const char *arg = a->cmd_arg;
     if (a->cred == CRED_PASS || (a->type == APP_IMAP && a->cred == CRED_USERPASS))

@@ -21,12 +21,12 @@ COLUMNS = ["frame", "ip.src", "ip.dst", "ip.proto", "ip.ttl", "srcport", "dstpor
            "icmp.type", "icmp.code",
            "dns.qry.name", "dns.qry.type", "dns.flags.response", "dns.count.answers", "dns.a",
            "http.method", "http.uri", "http.host", "http.code", "http.authbasic",
-           "tls.sni", "tls.alpn", "cmd", "cmd.arg"]
+           "tls.sni", "tls.alpn", "tls.partial", "cmd", "cmd.arg"]
 L4_COLUMNS = COLUMNS[5:14]
 DNS_COLUMNS = COLUMNS[14:19]
 HTTP_COLUMNS = COLUMNS[19:24]
-TLS_COLUMNS = COLUMNS[24:26]
-CMD_COLUMNS = COLUMNS[26:28]
+TLS_COLUMNS = COLUMNS[24:26]      # tls.partial is ours only; not compared
+CMD_COLUMNS = COLUMNS[27:29]
 
 DNS_PORTS = {"53", "5353", "5355"}
 HTTP_PORTS = {"80", "8080"}      # ports tshark decodes as HTTP by default
@@ -64,8 +64,26 @@ def tshark_escapes_to_hex(v):
     backslash itself in -T fields output (\\\\x1b). We print \\x1b. Convert
     theirs to ours so only real differences count."""
     v = v.replace("\\\\", "\\")                     # 4.6: \\x1b -> \x1b
+    # Invisible/bidi characters: Wireshark writes \u202E, we write the UTF-8
+    # bytes \xe2\x80\xae. Same character, both refuse to display it raw.
+    v = re.sub(r"\\u([0-9A-Fa-f]{4})",
+               lambda m: "".join("\\x%02x" % b for b in chr(int(m.group(1), 16)).encode()), v)
     v = re.sub(r"\\([0-7]{3})", lambda m: "\\x%02x" % int(m.group(1), 8), v)
     return re.sub(r"\\([abtnvfr])", lambda m: "\\x%02x" % C_ESCAPES[m.group(1)], v)
+
+
+# Characters sharkwatch deliberately escapes even though they're valid UTF-8
+# (C1 controls, invisible and bidi characters). In case a Wireshark version
+# shows one raw, escape it the way sharkwatch does before comparing.
+def _unsafe_char(ch):
+    cp = ord(ch)
+    return (0x80 <= cp <= 0x9F or 0x200B <= cp <= 0x200F or 0x2028 <= cp <= 0x202E or
+            0x2066 <= cp <= 0x2069 or cp in (0x061C, 0xFEFF))
+
+
+def escape_like_sharkwatch(v):
+    return "".join("".join("\\x%02x" % b for b in ch.encode()) if _unsafe_char(ch) else ch
+                   for ch in v)
 
 
 def norm(v):
@@ -101,7 +119,8 @@ def run_tshark(pcap):
     rows = {}
     for line in out.splitlines():
         p = dict(zip(FIELD_LIST, line.split("\t")))
-        row = {ours: norm(tshark_escapes_to_hex(p.get(f, ""))) for ours, f in TSHARK_FIELDS.items()}
+        row = {ours: norm(escape_like_sharkwatch(tshark_escapes_to_hex(p.get(f, ""))))
+               for ours, f in TSHARK_FIELDS.items()}
         row["srcport"] = p["tcp.srcport"] or p["udp.srcport"]
         row["dstport"] = p["tcp.dstport"] or p["udp.dstport"]
         row["cmd"] = p["ftp.request.command"] or p["pop.request.command"]
@@ -141,7 +160,8 @@ def columns_to_check(w):
 
 def compare(binary, pcap):
     ours, theirs = run_sharkwatch(binary, pcap), run_tshark(pcap)
-    mismatches = checked = 0
+    mismatches = checked = split_hellos = 0
+    split_streams = set()
     print(f"== {pcap}: {len(ours)} packets")
     if ours.keys() != theirs.keys():
         print(f"  packet count differs: sharkwatch {len(ours)}, tshark {len(theirs)}")
@@ -155,12 +175,29 @@ def compare(binary, pcap):
             print(f"  frame {frame:>3}: sharkwatch flagged \"{w['error']}\""
                   f"  | tshark: {t['expert'] or '(no warning)'}")
             continue
-        for c in columns_to_check(w):
+        cols = columns_to_check(w)
+        if "tls.sni" in cols:
+            # A ClientHello too big for one TCP segment: we decode one packet
+            # at a time (until Stage 4 reassembly), and tshark with stream
+            # reassembly off handles the pieces differently. Don't diff the
+            # first piece or the rest of that stream's hello.
+            stream = (w["ip.src"], w["srcport"], w["ip.dst"], w["dstport"])
+            if w["tls.partial"] == "1":
+                split_streams.add(stream)
+                split_hellos += 1
+            if w["tls.partial"] == "1" or (not w["tls.partial"] and stream in split_streams):
+                cols = [c for c in cols if c not in TLS_COLUMNS]
+            elif w["tls.partial"] == "0":
+                split_streams.discard(stream)
+        for c in cols:
             checked += 1
             if w[c] != t[c]:
                 mismatches += 1
                 print(f"  frame {frame:>3}: {c:<18} sharkwatch={w[c]!r:<24} tshark={t[c]!r}")
 
+    if split_hellos:
+        print(f"  {split_hellos} TLS ClientHello(s) split across TCP segments: not compared"
+              " (needs Stage 4 reassembly)")
     print(f"  {checked} fields compared, {mismatches} mismatches")
     return mismatches
 

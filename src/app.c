@@ -27,26 +27,78 @@ static int fail(packet_t *pkt, const char *why)
     return -1;
 }
 
-/* Append bytes to a NUL-terminated buffer, escaping anything that isn't
- * plain printable ASCII as \xNN, and silently truncating at the buffer's end.
- * This is what keeps a hostile "\x1b[2J" in a DNS name from clearing your
- * terminal (or worse) when the output is printed. */
+/* Is in[0..n) the start of a UTF-8 character that's safe to show as-is?
+ * Returns its length in bytes (2-4), or 0 if it should be escaped instead.
+ *
+ * Real-world names are often not ASCII ("Jake’s iPhone" has a 3-byte curly
+ * apostrophe), so valid UTF-8 is passed through. Rejected:
+ *   - invalid or "overlong" encodings and UTF-16 surrogates: malformed input
+ *     that different decoders interpret differently;
+ *   - C1 control characters (U+0080..U+009F): some terminals obey them;
+ *   - invisible and text-direction characters (zero-width spaces, bidi
+ *     overrides like U+202E). These are the "Trojan Source" trick
+ *     (CVE-2021-42574): U+202E can make "exe.gnp" display as "png.exe".  */
+static size_t utf8_safe_len(const uint8_t *in, size_t n)
+{
+    uint32_t cp;
+    size_t len;
+    uint8_t c = in[0];
+
+    if (c >= 0xC2 && c <= 0xDF)      { len = 2; cp = c & 0x1F; }
+    else if (c >= 0xE0 && c <= 0xEF) { len = 3; cp = c & 0x0F; }
+    else if (c >= 0xF0 && c <= 0xF4) { len = 4; cp = c & 0x07; }
+    else return 0;          /* 0x80-0xC1, 0xF5-0xFF never start a valid character */
+
+    if (len > n)
+        return 0;
+    for (size_t i = 1; i < len; i++) {
+        if ((in[i] & 0xC0) != 0x80)
+            return 0;
+        cp = cp << 6 | (in[i] & 0x3F);
+    }
+    if ((len == 3 && cp < 0x800) || (len == 4 && (cp < 0x10000 || cp > 0x10FFFF)))
+        return 0;                                   /* overlong / out of range */
+    if (cp >= 0xD800 && cp <= 0xDFFF)
+        return 0;                                   /* UTF-16 surrogate halves */
+    if (cp <= 0x9F)
+        return 0;                                   /* C1 controls */
+    if ((cp >= 0x200B && cp <= 0x200F) || (cp >= 0x2028 && cp <= 0x202E) ||
+        (cp >= 0x2066 && cp <= 0x2069) || cp == 0x061C || cp == 0xFEFF)
+        return 0;                                   /* invisible / bidi controls */
+    return len;
+}
+
+/* Append bytes to a NUL-terminated buffer, escaping anything unsafe as \xNN,
+ * and silently truncating at the buffer's end (never mid-character).
+ * Printable ASCII and safe UTF-8 pass through; control bytes, invalid UTF-8
+ * and invisible/bidi characters don't. This is what keeps a hostile
+ * "\x1b[2J" in a DNS name from clearing your terminal when it's printed. */
 static void append_safe(char *out, size_t outsz, const uint8_t *in, size_t n)
 {
+    static const char hex[] = "0123456789abcdef";
     size_t len = strlen(out);
+
     for (size_t i = 0; i < n && len + 1 < outsz; i++) {
         uint8_t c = in[i];
         if (c >= 0x20 && c < 0x7f && c != '\\') {
             out[len++] = (char)c;
-        } else {
-            if (len + 4 >= outsz)
-                break;
-            static const char hex[] = "0123456789abcdef";
-            out[len++] = '\\';
-            out[len++] = 'x';
-            out[len++] = hex[c >> 4];
-            out[len++] = hex[c & 0xF];
+            continue;
         }
+        size_t k = c >= 0x80 ? utf8_safe_len(in + i, n - i) : 0;
+        if (k) {
+            if (len + k >= outsz)
+                break;
+            memcpy(out + len, in + i, k);
+            len += k;
+            i += k - 1;
+            continue;
+        }
+        if (len + 4 >= outsz)
+            break;
+        out[len++] = '\\';
+        out[len++] = 'x';
+        out[len++] = hex[c >> 4];
+        out[len++] = hex[c & 0xF];
     }
     out[len] = '\0';
 }

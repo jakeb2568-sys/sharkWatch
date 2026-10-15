@@ -22,7 +22,8 @@ void print_packet(FILE *out, const packet_t *pkt, uint64_t frame_no,
  *   icmp.type  icmp.code
  *   dns.qry.name  dns.qry.type  dns.flags.response  dns.count.answers  dns.a
  *   http.method  http.uri  http.host  http.code  http.authbasic
- *   tls.sni  tls.alpn  cmd  cmd.arg  error
+ *   tls.sni  tls.alpn  tls.partial  cmd  cmd.arg  error
+ *   (tls.partial: 1 = ClientHello continues in a later TCP segment)
  * Passwords are masked unless print_set_reveal_passwords(true).        */
 void print_packet_tsv(FILE *out, const packet_t *pkt, uint64_t frame_no);
 

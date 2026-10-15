@@ -132,10 +132,21 @@ the worst:
   all on the self-pointing case in `samples/app_layer.pcap`.)
 - **Every extracted string is sanitized before printing.** A DNS name or HTTP
   header can contain terminal escape codes. `ESC[2J`, for example, clears the
-  screen of whoever is reading the output. Non-printable bytes are shown as
-  `\xNN` escapes, so `\x1b[2Jgotcha.example.com` is displayed as text instead of
-  being executed by the terminal. Fuzzing confirmed that no raw control bytes
-  ever reach the output.
+  screen of whoever is reading the output. Unsafe bytes are shown as `\xNN`
+  escapes, so `\x1b[2Jgotcha.example.com` is displayed as text instead of
+  being executed by the terminal.
+- **Unicode is allowed, but not the dangerous parts.** Real device names aren't
+  ASCII (`Jake’s Laptop` has a 3-byte curly apostrophe), so valid UTF-8 is
+  shown as-is. Still escaped:
+  - invalid or overlong UTF-8
+  - C1 control characters
+  - invisible characters
+  - bidi overrides like U+202E, the "Trojan Source" trick
+    ([CVE-2021-42574](https://trojansource.codes/)) that can make
+    `invoice_` + U+202E + `exe.doc` *display* as `invoice_cod.exe`
+
+  Fuzzing with 20,000 hostile names confirmed that the output is always valid
+  UTF-8 with no control, invisible or bidi characters.
 - **Fixed-size buffers, length-bounded copies.** No string is assumed to be
   NUL-terminated, and every copy is truncated to its buffer.
 - **Passwords are masked by default.** Output tends to end up in tickets,
@@ -203,6 +214,15 @@ On real traffic, the comparison passes with 0 mismatches on:
 You can run it on any capture of your own:
 `python3 tests/verify_against_tshark.py ./sharkwatch your.pcap`.
 
+ClientHellos split across TCP segments (common with browsers) are counted and
+reported separately rather than compared. Without stream reassembly, sharkwatch
+and Wireshark recover different parts of the pieces, so there's nothing
+meaningful to diff until Stage 4.
+
+The verifier works with both Wireshark 4.2 and 4.6, which spell escaped
+characters differently (`\033` vs `\\x1b` vs `\u202E`). It normalizes those
+spellings so only real differences count.
+
 The test also has to be able to fail. Planting bugs confirms that it does: a
 missing `ntohs()` on a port, an SNI copied one byte short, and a skipped DNS
 answer are each caught immediately.
@@ -228,6 +248,8 @@ answer are each caught immediately.
   - HTTP with Basic auth, and HTTP on port 8080
   - real OpenSSL ClientHellos, including one split across two segments
   - FTP, POP3 and IMAP logins
+  - a ClientHello split *after* its SNI, as large browser hellos are
+  - mDNS names with a curly apostrophe and a bidi-override character
   - hostile DNS: self-pointing and mutually-pointing compression loops, a lying
     answer count, a terminal escape sequence in a name, and a runt header
 

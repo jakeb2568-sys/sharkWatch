@@ -182,6 +182,22 @@ def app_layer():
     pkts.append(tcp(CLIENT, SERVER, 51101, 443, hello2[:120]))
     pkts.append(tcp(CLIENT, SERVER, 51101, 443, hello2[120:]))
 
+    # Split again, but this time the cut falls *after* the SNI extension, as
+    # with big browser hellos: the hostname is visible in the first piece.
+    hello3 = tls_client_hello("shop.example.net", ["h2", "http/1.1"])
+    cut = hello3.index(b"shop.example.net") + len(b"shop.example.net") + 4
+    pkts.append(tcp(CLIENT, SERVER, 51102, 443, hello3[:cut]))
+    pkts.append(tcp(CLIENT, SERVER, 51102, 443, hello3[cut:]))
+
+    # --- Non-ASCII names ---------------------------------------------------
+    # Valid UTF-8 (a curly apostrophe) should display as-is...
+    pkts.append(eth() / IP(src=CLIENT, dst="224.0.0.251", ttl=255) / UDP(sport=5353, dport=5353)
+                / DNS(id=0, qd=[DNSQR(qname="Jake\u2019s Laptop._airplay._tcp.local".encode(), qtype="PTR")]))
+    # ...but a right-to-left override (U+202E) must not: it would make this
+    # name *display* as "invoice_cod.exe" ("Trojan Source", CVE-2021-42574).
+    pkts.append(eth() / IP(src=CLIENT, dst="224.0.0.251", ttl=255) / UDP(sport=5353, dport=5353)
+                / DNS(id=0, qd=[DNSQR(qname="invoice_\u202eexe.doc.local".encode(), qtype="A")]))
+
     # --- Plaintext logins (fake credentials) ----------------------------
     pkts.append(tcp(FTP_SRV, CLIENT, 21, 51200, b"220 ProFTPD Server ready\r\n"))
     pkts.append(tcp(CLIENT, FTP_SRV, 51200, 21, b"USER alice\r\n"))
