@@ -67,6 +67,8 @@ typedef struct packet {
 
     /* ---- problems ---- */
     const char *error;          /* NULL if decoded cleanly, else a static message */
+    const char *notice;         /* suspicious but not malformed (set by flow tracking) */
+    bool     retransmission;    /* TCP data we already saw (set by flow tracking) */
 } packet_t;
 
 /* Is this pcap link-layer type (pcap_datalink()) one we can decode? */

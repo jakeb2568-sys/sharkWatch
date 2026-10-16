@@ -3,7 +3,17 @@
 A packet analyzer written in C on top of libpcap. It decodes Ethernet, VLAN,
 IPv4, TCP, UDP and ICMP headers by hand, plus the application layer: DNS
 lookups, HTTP requests, the hostname inside TLS handshakes, and cleartext
-logins. Every field is checked against Wireshark's own dissectors.
+logins.
+
+It also tracks connections, using:
+
+- a flow table built on a keyed hash table
+- TCP state tracking
+- TCP stream reassembly
+- per-connection context
+
+All of these are hardened against memory-exhaustion attacks. Every decoded
+field and every conversation is checked against Wireshark.
 
 This is the base for a small network intrusion detector. See the [roadmap](#roadmap).
 
@@ -35,6 +45,30 @@ $ ./sharkwatch -r samples/app_layer.pcap
      ...
 ```
 
+Connection tracking rebuilds messages split across TCP segments and ties
+packets together:
+
+```
+$ ./sharkwatch -r samples/flows.pcap -F 6
+    7  ... 192.168.1.10:52001 -> 93.184.216.34:443  TCP ... TLS ClientHello SNI=reassembled.example.com ALPN=h2 (reassembled from 3 segments)
+   15  ... 192.168.1.10:52002 -> 93.184.216.34:443  TCP ... TLS ClientHello SNI=attacker.example.net  [*] overlapping TCP segment with different data (first copy kept)
+   16  ... 192.168.1.10:52002 -> 93.184.216.34:443  TCP ... TLS ClientHello SNI=innocent.example.com ALPN=h2 (reassembled from 2 segments)
+   34  ... 192.168.1.10:52004 -> 10.0.0.21:21  TCP ... FTP PASS ********  (user alice)  [CLEARTEXT CREDENTIAL]
+   43  ... 10.0.0.80:80 -> 192.168.1.10:52005  TCP ... HTTP 200 OK  (answers GET /index.html)
+
+--- Top 6 conversations by bytes (of 10) ---
+  proto client                   server                 packets      bytes  duration  state        about
+  TCP   192.168.1.10:52001    -> 93.184.216.34:443           10     1.1 KB     0.11s  closed       reassembled.example.com
+  TCP   192.168.1.10:52002    -> 93.184.216.34:443            9     1.1 KB     0.10s  closed       innocent.example.com
+  TCP   192.168.1.10:52003    -> 93.184.216.34:443            8      949 B     0.09s  closed       wraparound.example.com
+  TCP   192.168.1.10:52005    -> 10.0.0.80:80                10      720 B     0.11s  closed       shop.example
+  TCP   192.168.1.10:52004    -> 10.0.0.21:21                11      667 B     0.12s  closed       FTP login: alice
+  TCP   192.168.1.10:52006    -> 10.0.0.80:80                 7      421 B     0.07s  closed       shop.example
+  ...
+  Flows: 9 TCP (7 handshakes, 1 mid-stream, 1 reset, 1 port reuse), 1 UDP; peak 9 active
+  Reassembly: 3 split ClientHello(s) rebuilt, 2 retransmission(s), 1 overlap conflict(s)
+```
+
 (All credentials in the sample captures are fake.)
 
 ## Build
@@ -59,6 +93,9 @@ sharkwatch (-r FILE | -i IFACE) [options] [BPF filter]
   -v          verbose: add an L2/L3 detail line per packet
   -T          tab-separated fields instead (for scripts / diffing)
   -P          show cleartext passwords instead of ********
+  -F N        after the packets, list the top N conversations by bytes
+              (0 = all; with -T, as tab-separated "flow" rows)
+  -m N        track at most N connections at once (default 65536)
 ```
 
 Examples:
@@ -68,6 +105,7 @@ Examples:
 ./sharkwatch -r capture.pcapng tcp port 443          # BPF filter, same syntax as tcpdump
 ./sharkwatch -r capture.pcapng udp port 53           # every DNS lookup
 ./sharkwatch -r capture.pcapng > /dev/null           # summary only, incl. credentials seen
+./sharkwatch -r capture.pcapng -F 10 | tail -20      # top 10 conversations + summary
 sudo ./sharkwatch -i eth0 -c 100 -v
 sudo ./sharkwatch -i any not port 22                 # Linux "any" pseudo-interface
 ```
@@ -85,6 +123,7 @@ Live capture stops cleanly on Ctrl-C and prints a summary including kernel drop 
 | | **HTTP/1.x**: method, URI, Host, status; detected by content on any port |
 | | **TLS**: Server Name Indication (SNI) and ALPN from the ClientHello |
 | | **Cleartext logins**: FTP and POP3 `USER`/`PASS`, IMAP `LOGIN`, HTTP Basic auth |
+| Connections | TCP/UDP flows, TCP state, retransmissions, stream reassembly of split ClientHellos, FTP USER+PASS pairing, HTTP response-to-request matching |
 
 ## How it works
 
@@ -95,11 +134,15 @@ pcap_loop ─▶ decode_packet() ─▶ packet_t ─▶ print_packet() / print_p
               ├─ network:      IPv4 (options, fragments)
               ├─ transport:    TCP, UDP, ICMP                        (decode.c)
               └─ application:  DNS, HTTP, TLS ClientHello, FTP/POP3/IMAP  (app.c)
+                    │
+                    ▼
+              flow_update()   connection tracking + reassembly        (flow.c)
 ```
 
 Decoding and printing are separate. The decoders fill a `packet_t` struct and
-never print anything, so later stages (flow tracking, detection) can use
-decoded packets without touching raw bytes.
+never print anything. The flow tracker then enriches it, attaching a reassembled
+hello, a paired login, or the request a response answers. Later stages
+(detection) consume `packet_t` and the flow table without touching raw bytes.
 
 ### Header parsing
 
@@ -169,15 +212,71 @@ front of it, in the same segment. sharkwatch skips those records and labels
 the result `(retry after HelloRetryRequest)`. Steam's client was caught doing
 this in a real home capture, which is how this case was found.
 
+### Connection tracking (`flow.c`)
+
+Packets are grouped into **flows**: one TCP connection or UDP conversation,
+with both directions mapped to the same entry.
+
+- **Hash table with a secret key.** Flows live in a chained hash table. A
+  predictable hash function lets an attacker pick addresses and ports that all
+  land in one bucket, turning every lookup into a linear scan ("hash
+  flooding"). sharkwatch hashes with **SipHash-2-4** under a random per-run key,
+  the same defense Python, Rust and the Linux kernel use.
+- **TCP state.** Handshakes, FIN/RST teardown, connections the capture joined
+  mid-stream, and **port reuse** are tracked. A fresh SYN on a closed
+  connection starts a new flow, as in Wireshark.
+- **Stream-head reassembly.** Large modern ClientHellos (post-quantum key shares)
+  don't fit in one segment. When the first segment's message is incomplete,
+  sharkwatch buffers the start of that stream (up to 16 KB) and places each
+  segment by sequence number, so out-of-order delivery, duplicates and
+  sequence-number wraparound past 2³² all work. The decoded result is attached
+  to the segment that completes it, labelled `(reassembled from N segments)`.
+  Wireshark reports it the same way.
+- **Overlapping segments with conflicting data are flagged.** Sending the same
+  sequence numbers twice with *different* bytes is a classic IDS-evasion
+  technique (Ptacek & Newsham, 1998): the IDS and the target host may each
+  keep a different copy. sharkwatch keeps the first copy and marks the packet
+  `[*] overlapping TCP segment with different data`. In the sample, the
+  conflicting segment by itself claims `attacker.example.net`, while the
+  reassembled stream says `innocent.example.com`.
+- **Retransmissions** (data at or below sequence numbers already seen) are
+  labelled and not counted twice, so a retransmitted login doesn't show up as
+  two credentials.
+- **Per-connection context.** An FTP/POP3 `PASS` is paired with the same
+  connection's `USER`, and an HTTP response is matched with the request it
+  answers.
+
+### Resource limits: the IDS as a target
+
+An IDS has to store state for traffic an attacker controls, so an attacker can
+try to exhaust its memory and blind it. Every resource is capped:
+
+| Resource | Limit | When exceeded |
+|---|---|---|
+| Tracked flows | 65,536 (`-m`) | least-recently-used flow evicted (O(1) via an LRU list) |
+| Idle flows | 300 s without a packet | expired |
+| Reassembly per stream | first 16 KB / 64 segments, and only when a message is split | stop buffering that stream |
+| Reassembly overall | 64 MB across all flows | new reassemblies refused, counted |
+
+`tests/stress_flows.py` attacks these limits directly:
+
+```
+SYN flood, 500,000 SYNs, cap  65536: peak 65536 flows, 434464 evicted, max RSS 38 MB  OK
+SYN flood, 500,000 SYNs, cap   1000: peak 1000 flows, 499000 evicted, max RSS 4 MB  OK
+Reassembly bomb, 20,000 stalled hellos: 16360 reassemblies refused by the 64 MB budget, max RSS 76 MB  OK
+```
+
+Without the reassembly budget, the 20,000 half-finished handshakes would pin
+about 360 MB.
+
 ### Known limits
 
-- **One packet at a time.** A message split across several TCP segments is
-  decoded only from the segment that contains its start. This matters for
-  large modern ClientHellos (post-quantum key shares push them past one segment),
-  which are reported as `(continues in next segment)` when the SNI isn't in the
-  first part. TCP stream reassembly arrives with flow tracking in Stage 4.
-- FTP/POP3 usernames and passwords arrive in separate packets and are listed
-  separately. Pairing them per connection is also a Stage 4 job.
+- Only the **first message** of each stream direction is reassembled (that's
+  where the TLS hostname is). An HTTP request whose headers span segments is
+  decoded from its first segment only.
+- For connections the capture joined **mid-stream**, reassembly starts at the
+  first data seen, so a split message that began before the capture can't be
+  rebuilt.
 - DNS over HTTPS and QUIC (HTTP/3) are encrypted, so their lookups and hostnames
   aren't visible here.
 
@@ -192,22 +291,29 @@ capture and compares, packet by packet:
   length, ICMP type/code
 - **DNS:** question name and type, response flag, answer count, first A record
 - **HTTP:** method, URI, Host, status code, Basic auth
-- **TLS:** SNI, ALPN
+- **TLS:** SNI, ALPN, compared against Wireshark's own TCP reassembly, so
+  split hellos are checked too
 - **FTP/POP3:** command and argument
+- **Conversations:** every TCP/UDP flow's packet and byte counts in each
+  direction, sharkwatch's flow table against Wireshark's `tcp.stream` /
+  `udp.stream`
 
 ```
 $ make test
-== samples/app_layer.pcap: 26 packets
-  frame  22: sharkwatch flagged "DNS name compression loop"  | tshark: (no warning)
-  frame  23: sharkwatch flagged "DNS name compression loop"  | tshark: Extraneous data
-  frame  24: sharkwatch flagged "truncated DNS name"  | tshark: Malformed Packet (Exception occurred)
-  frame  26: sharkwatch flagged "truncated DNS header"  | tshark: Malformed Packet (Exception occurred)
-  352 fields compared, 0 mismatches
+== samples/app_layer.pcap: 31 packets
+  2 TLS ClientHello(s) split across segments; 2 reassembled and compared
+  427 fields compared, 0 mismatches
+  17 conversations compared, 0 mismatches
 == samples/basic.pcap: 15 packets
-  218 fields compared, 0 mismatches
+  210 fields compared, 0 mismatches
+  2 conversations compared, 0 mismatches
 == samples/edge_cases.pcap: 12 packets
-  ...
   92 fields compared, 0 mismatches
+  5 conversations compared, 0 mismatches
+== samples/flows.pcap: 68 packets
+  5 TLS ClientHello(s) split across segments; 3 reassembled and compared
+  1040 fields compared, 0 mismatches
+  10 conversations compared, 0 mismatches
 
 PASS
 ```
@@ -216,18 +322,19 @@ On real traffic, the comparison passes with 0 mismatches on:
 
 - **An 11,000-packet home Wi-Fi capture** recorded in Wireshark on Windows
   (139,762 fields).
+- **A 4,000-packet capture** made to exercise Stage 3 on real services: DNS,
+  NXDOMAIN, HTTP Basic auth, FTP, HTTPS from curl and a browser, and Steam's
+  TLS 1.3 HelloRetryRequest.
 - **8,000+ packets of live traffic** covering real TLS handshakes from curl,
-  OpenSSL and Python, real DNS answers, and HTTP with Basic auth (122,867 fields).
+  OpenSSL and Python, a forced HelloRetryRequest, a TLS 1.2 handshake, real DNS
+  answers, and HTTP with Basic auth. Their conversations match Wireshark's too.
 
 You can run it on any capture of your own:
 `python3 tests/verify_against_tshark.py ./sharkwatch your.pcap`.
 
 TLS fields are compared on client-to-server packets only. sharkwatch decodes
 the ClientHello, while in TLS 1.2 tshark also reports the server's chosen ALPN
-from the ServerHello. ClientHellos split across TCP segments (common with
-browsers) are counted and reported separately rather than compared. Without stream reassembly, sharkwatch
-and Wireshark recover different parts of the pieces, so there's nothing
-meaningful to diff until Stage 4.
+from the ServerHello.
 
 The verifier works with both Wireshark 4.2 and 4.6, which spell escaped
 characters differently (`\033` vs `\\x1b` vs `\u202E`). It normalizes those
@@ -236,6 +343,29 @@ spellings so only real differences count.
 The test also has to be able to fail. Planting bugs confirms that it does: a
 missing `ntohs()` on a port, an SNI copied one byte short, and a skipped DNS
 answer are each caught immediately.
+
+### Property-based reassembly test
+
+`tests/reassembly_property.py` builds thousands of connections, each carrying
+a real ClientHello with a unique hostname. It then mangles delivery the way
+real networks do:
+
+- cuts each hello into 1-6 segments at random points
+- shuffles the segments
+- duplicates some of them
+- starts some sequence numbers just below 2³² so they wrap mid-hello
+
+The property: every connection yields exactly one decoded hello, with the
+right hostname. It runs 10,000 connections across 5 seeds with 0 failures.
+
+Its first run found two real bugs:
+
+- **A tiny first segment made sharkwatch give up on the stream.** A first
+  piece under 6 bytes is too short to recognize as TLS.
+- **Retransmitted hellos were counted twice.**
+
+Both are fixed, and the test guards them. `make check` runs this test and the
+stress tests on top of `make test`.
 
 ### Sample captures
 
@@ -263,19 +393,33 @@ answer are each caught immediately.
   - mDNS names with a curly apostrophe and a bidi-override character
   - hostile DNS: self-pointing and mutually-pointing compression loops, a lying
     answer count, a terminal escape sequence in a name, and a runt header
+- **`flows.pcap`**: connection tracking:
+  - a hello in 3 segments delivered out of order with a duplicate
+  - an overlapping segment with conflicting data
+  - sequence-number wraparound
+  - FTP login pairing and HTTP keep-alive
+  - port reuse, a mid-stream connection, a reset, and a UDP conversation
 
 ### Fuzzing
 
-`make sanitize` builds with AddressSanitizer and UndefinedBehaviorSanitizer.
-That build was run against about 70,000 randomly corrupted packets:
+`make sanitize` builds with AddressSanitizer (including leak detection) and
+UndefinedBehaviorSanitizer. That build was run against about 270,000 hostile
+packets:
 
 - **20,000 aimed at the header parsers:** bit flips, truncations, bad header
   lengths, and wire lengths that don't match.
 - **50,000 aimed at the application parsers:** corrupted DNS/TLS/HTTP payloads,
   forged length fields and compression pointers.
+- **200,000 chaotic TCP/UDP packets aimed at the flow tracker:**
+  - colliding ports
+  - random flags and sequence numbers
+  - RSTs in the middle of reassembly
+  - partial and CCS-prefixed hellos
+  - idle gaps that trigger expiry
+  - table caps as small as 1 flow, to force constant eviction
 
-Result: no memory errors, no undefined behavior, and no raw control characters
-in 60,000+ lines of output from hostile input.
+Result: no memory errors, no leaks, no undefined behavior, and no raw control
+characters in the output from hostile input.
 
 ## Roadmap
 
@@ -283,7 +427,7 @@ in 60,000+ lines of output from hostile input.
 - [x] **Stage 1**: Ethernet, VLAN, Linux cooked and IPv4 decoding
 - [x] **Stage 2**: TCP / UDP / ICMP decoding, tshark verification, fuzzing
 - [x] **Stage 3**: application layer: DNS, HTTP, TLS SNI, cleartext credentials
-- [ ] **Stage 4**: per-flow state tracking (hash table of connections), TCP reassembly
+- [x] **Stage 4**: connection tracking: keyed hash table, TCP state, stream reassembly, resource limits
 - [ ] **Stage 5**: detection: port scans, SYN floods, ARP spoofing
 
 ## Layout
@@ -292,11 +436,13 @@ in 60,000+ lines of output from hostile input.
 include/proto.h    on-the-wire header structs and constants
 include/decode.h   packet_t, the decoded representation
 include/app.h      application-layer fields (DNS, HTTP, TLS, credentials)
+include/flow.h     flow table, TCP state, reassembly, resource limits
 src/decode.c       link / network / transport decoders
 src/app.c          application-layer decoders
+src/flow.c         connection tracking (SipHash table, LRU, reassembly)
 src/print.c        human-readable and TSV output
 src/main.c         CLI, capture loop, stats
 scripts/           sample capture generator
 samples/           test captures
-tests/             tshark comparison
+tests/             tshark comparison, reassembly property test, stress tests
 ```

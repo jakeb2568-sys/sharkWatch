@@ -10,6 +10,8 @@ file and compares:
     ICMP type/code
   - application layer: DNS question/answers, HTTP method/URI/Host/status/Basic
     auth, TLS SNI/ALPN, FTP and POP3 commands
+  - connections: every TCP/UDP conversation's packet and byte counts in each
+    direction (sharkwatch's flow table vs tshark's tcp.stream / udp.stream)
 Exits non-zero on any mismatch.
 """
 import re
@@ -21,11 +23,11 @@ COLUMNS = ["frame", "ip.src", "ip.dst", "ip.proto", "ip.ttl", "srcport", "dstpor
            "icmp.type", "icmp.code",
            "dns.qry.name", "dns.qry.type", "dns.flags.response", "dns.count.answers", "dns.a",
            "http.method", "http.uri", "http.host", "http.code", "http.authbasic",
-           "tls.sni", "tls.alpn", "tls.partial", "cmd", "cmd.arg"]
+           "tls.sni", "tls.alpn", "tls.state", "cmd", "cmd.arg", "tcp.retrans"]
 L4_COLUMNS = COLUMNS[5:14]
 DNS_COLUMNS = COLUMNS[14:19]
 HTTP_COLUMNS = COLUMNS[19:24]
-TLS_COLUMNS = COLUMNS[24:26]      # tls.partial is ours only; not compared
+TLS_COLUMNS = COLUMNS[24:26]      # tls.state is ours only; not compared
 CMD_COLUMNS = COLUMNS[27:29]
 
 DNS_PORTS = {"53", "5353", "5355"}
@@ -51,6 +53,7 @@ TSHARK_FIELDS = {
 EXTRA_FIELDS = ["tcp.srcport", "udp.srcport", "tcp.dstport", "udp.dstport",
                 "ftp.request.command", "ftp.request.arg",
                 "pop.request.command", "pop.request.parameter",
+                "tcp.stream", "udp.stream", "frame.len",
                 "_ws.expert.message"]
 FIELD_LIST = list(TSHARK_FIELDS.values()) + EXTRA_FIELDS
 
@@ -95,16 +98,20 @@ def norm(v):
 
 
 def run_sharkwatch(binary, pcap):
-    # -P: compare real passwords, not the ******** mask
-    out = subprocess.run([binary, "-T", "-P", "-r", pcap],
+    # -P: compare real passwords, not the ******** mask; -F 0: list all flows
+    out = subprocess.run([binary, "-T", "-P", "-F", "0", "-r", pcap],
                          capture_output=True, text=True, check=True).stdout
-    rows = {}
+    rows, flows = {}, []
     for line in out.splitlines():
         parts = line.split("\t")
+        if parts[0] == "flow":
+            # flow proto cli_ip cli_port srv_ip srv_port pkts0 bytes0 pkts1 bytes1 ...
+            flows.append(parts[1:10])
+            continue
         row = dict(zip(COLUMNS, map(norm, parts[:len(COLUMNS)])))
         row["error"] = parts[len(COLUMNS)] if len(parts) > len(COLUMNS) else ""
         rows[row["frame"]] = row
-    return rows
+    return rows, flows
 
 
 def run_tshark(pcap):
@@ -126,8 +133,75 @@ def run_tshark(pcap):
         row["cmd"] = p["ftp.request.command"] or p["pop.request.command"]
         row["cmd.arg"] = p["ftp.request.arg"] or p["pop.request.parameter"]
         row["expert"] = p.get("_ws.expert.message", "")
+        row["tcp.stream"], row["udp.stream"] = p["tcp.stream"], p["udp.stream"]
+        row["frame.len"] = p["frame.len"]
         rows[row["frame"]] = row
     return rows
+
+
+def run_tshark_tls(pcap):
+    """TLS fields with TCP reassembly ON, like sharkwatch's flow tracker: a
+    ClientHello split over several segments is reported on the segment that
+    completes it."""
+    cmd = ["tshark", "-r", pcap, "-o", "ip.defragment:FALSE",
+           "-o", "tcp.reassemble_out_of_order:TRUE",   # sharkwatch places segments by seq too
+           "-T", "fields", "-E", "separator=/t", "-E", "occurrence=f",
+           "-e", "frame.number", "-e", TSHARK_FIELDS["tls.sni"], "-e", TSHARK_FIELDS["tls.alpn"]]
+    out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+    tls = {}
+    for line in out.splitlines():
+        f, sni, alpn = (line.split("\t") + ["", "", ""])[:3]
+        tls[f] = {"tls.sni": norm(escape_like_sharkwatch(tshark_escapes_to_hex(sni))),
+                  "tls.alpn": norm(alpn)}
+    return tls
+
+
+def conversations_tshark(ours, theirs):
+    """Group tshark's packets by tcp.stream / udp.stream. Only packets that
+    sharkwatch decoded down to TCP/UDP ports count (not ICMP errors quoting a
+    UDP header, not later IP fragments, not packets truncated mid-header)."""
+    conv = {}
+    for frame, w in ours.items():
+        if w["ip.proto"] not in ("6", "17") or not w["srcport"]:
+            continue
+        t = theirs[frame]
+        sid = t["tcp.stream"] if w["ip.proto"] == "6" else t["udp.stream"]
+        if sid == "":
+            continue
+        c = conv.setdefault((w["ip.proto"], sid), {})
+        ep = (w["ip.src"], w["srcport"])
+        pk, by = c.get(ep, (0, 0))
+        c[ep] = (pk + 1, by + int(t["frame.len"]))
+    return conv
+
+
+def conv_signature(proto, eps):
+    """Order-independent description of one conversation."""
+    return (proto,) + tuple(sorted((f"{ip}:{port}", pk, by) for (ip, port), (pk, by) in eps.items()))
+
+
+def compare_flows(ours_rows, our_flows, theirs):
+    proto_num = {"TCP": "6", "UDP": "17"}
+    mine = []
+    for proto, cip, cport, sip, sport, p0, b0, p1, b1 in our_flows:
+        eps = {}                                  # endpoints that actually sent something
+        if int(p0):
+            eps[(cip, cport)] = (int(p0), int(b0))
+        if int(p1):
+            eps[(sip, sport)] = (int(p1), int(b1))
+        mine.append(conv_signature(proto_num[proto], eps))
+    theirs_sig = [conv_signature(proto, eps)
+                  for (proto, _), eps in conversations_tshark(ours_rows, theirs).items()]
+    missing = sorted(set(theirs_sig) - set(mine))
+    extra = sorted(set(mine) - set(theirs_sig))
+    if len(mine) != len(theirs_sig) and not missing and not extra:
+        missing = ["(same conversations, different counts of duplicates)"]
+    for sig in missing[:5]:
+        print(f"  conversation only in tshark:     {sig}")
+    for sig in extra[:5]:
+        print(f"  conversation only in sharkwatch: {sig}")
+    print(f"  {len(mine)} conversations compared, {len(missing) + len(extra)} mismatches")
+    return len(missing) + len(extra)
 
 
 def columns_to_check(w):
@@ -162,9 +236,8 @@ def columns_to_check(w):
 
 
 def compare(binary, pcap):
-    ours, theirs = run_sharkwatch(binary, pcap), run_tshark(pcap)
-    mismatches = checked = split_hellos = 0
-    split_streams = set()
+    (ours, our_flows), theirs, tls = run_sharkwatch(binary, pcap), run_tshark(pcap), run_tshark_tls(pcap)
+    mismatches = checked = split_hellos = reassembled = 0
     print(f"== {pcap}: {len(ours)} packets")
     if ours.keys() != theirs.keys():
         print(f"  packet count differs: sharkwatch {len(ours)}, tshark {len(theirs)}")
@@ -180,18 +253,16 @@ def compare(binary, pcap):
             continue
         cols = columns_to_check(w)
         if "tls.sni" in cols:
-            # A ClientHello too big for one TCP segment: we decode one packet
-            # at a time (until Stage 4 reassembly), and tshark with stream
-            # reassembly off handles the pieces differently. Don't diff the
-            # first piece or the rest of that stream's hello.
-            stream = (w["ip.src"], w["srcport"], w["ip.dst"], w["dstport"])
-            if w["tls.partial"] == "1":
-                split_streams.add(stream)
+            # TLS is compared with tshark's *reassembled* view: a split hello
+            # is reported on the segment that completes it, by both tools.
+            # The first piece (tls.state=partial) is our own early look at
+            # it; tshark shows nothing there, so it isn't compared.
+            t = dict(t, **tls.get(frame, {"tls.sni": "", "tls.alpn": ""}))
+            if w["tls.state"] == "partial":
                 split_hellos += 1
-            if w["tls.partial"] == "1" or (not w["tls.partial"] and stream in split_streams):
                 cols = [c for c in cols if c not in TLS_COLUMNS]
-            elif w["tls.partial"] == "0":
-                split_streams.discard(stream)
+            elif w["tls.state"] == "reassembled":
+                reassembled += 1
         for c in cols:
             checked += 1
             if w[c] != t[c]:
@@ -199,10 +270,10 @@ def compare(binary, pcap):
                 print(f"  frame {frame:>3}: {c:<18} sharkwatch={w[c]!r:<24} tshark={t[c]!r}")
 
     if split_hellos:
-        print(f"  {split_hellos} TLS ClientHello(s) split across TCP segments: not compared"
-              " (needs Stage 4 reassembly)")
+        print(f"  {split_hellos} TLS ClientHello(s) split across segments; "
+              f"{reassembled} reassembled and compared")
     print(f"  {checked} fields compared, {mismatches} mismatches")
-    return mismatches
+    return mismatches + compare_flows(ours, our_flows, theirs)
 
 
 if __name__ == "__main__":

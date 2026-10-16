@@ -5,6 +5,7 @@
 #include "proto.h"
 
 #include <arpa/inet.h>
+#include <string.h>
 
 /* Note: we use inet_ntop() with our own buffers, not inet_ntoa(). inet_ntoa()
  * returns a pointer to one shared static buffer, so
@@ -258,6 +259,8 @@ static void print_app(FILE *out, const packet_t *pkt)
         break;
     case APP_HTTP_RESPONSE:
         fprintf(out, "  HTTP %u %s", a->http_status, a->http_reason);
+        if (a->http_request_for[0])
+            fprintf(out, "  (answers %s)", a->http_request_for);
         break;
     case APP_TLS_CLIENT_HELLO:
         fprintf(out, "  TLS ClientHello");
@@ -269,6 +272,8 @@ static void print_app(FILE *out, const packet_t *pkt)
             fprintf(out, " (continues in next segment)");
         if (a->tls_retry)
             fprintf(out, " (retry after HelloRetryRequest)");
+        if (a->reassembled_segments)
+            fprintf(out, " (reassembled from %u segments)", a->reassembled_segments);
         break;
     case APP_FTP:
     case APP_POP3:
@@ -276,6 +281,8 @@ static void print_app(FILE *out, const packet_t *pkt)
         fprintf(out, "  %s %s", app_proto_name(a->type), a->cmd);
         if (a->cred == CRED_PASS)
             fprintf(out, " %s", secret(a->cred_pass));
+        else if (a->cred_paired)
+            fprintf(out, " %s  (user %s)", secret(a->cred_pass), a->cred_user);
         else if (a->cred == CRED_USERPASS)
             fprintf(out, " %s %s", a->cred_user, secret(a->cred_pass));
         else if (a->cmd_arg[0])
@@ -348,14 +355,14 @@ void print_packet_tsv(FILE *out, const packet_t *pkt, uint64_t frame_no)
 
     fprintf(out, "\t%s\t%s\t", a->tls_sni, a->tls_alpn);
     if (a->type == APP_TLS_CLIENT_HELLO)
-        fputc(a->tls_partial ? '1' : '0', out);
+        fputs(a->reassembled_segments ? "reassembled" : a->tls_partial ? "partial" : "full", out);
 
     const char *arg = a->cmd_arg;
-    if (a->cred == CRED_PASS || (a->type == APP_IMAP && a->cred == CRED_USERPASS))
+    if (strcmp(a->cmd, "PASS") == 0 || (a->type == APP_IMAP && a->cred == CRED_USERPASS))
         arg = g_reveal_passwords ? a->cmd_arg : "********";
     fprintf(out, "\t%s\t%s", a->cmd, a->cmd[0] ? arg : "");
 
-    fprintf(out, "\t%s\n", pkt->error ? pkt->error : "");
+    fprintf(out, "\t%s\t%s\n", pkt->retransmission ? "1" : "", pkt->error ? pkt->error : "");
 }
 
 static void print_l2_only(FILE *out, const packet_t *pkt)
@@ -387,6 +394,10 @@ void print_packet(FILE *out, const packet_t *pkt, uint64_t frame_no,
 
     if (pkt->error)
         fprintf(out, "  [!] %s", pkt->error);
+    if (pkt->notice)
+        fprintf(out, "  [*] %s", pkt->notice);
+    else if (pkt->retransmission)
+        fprintf(out, "  [retransmission]");
     fputc('\n', out);
 
     if (!verbose)

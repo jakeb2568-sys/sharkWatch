@@ -66,6 +66,11 @@ typedef struct {
     bool     tls_partial;                   /* hello continues in a later segment */
     bool     tls_retry;                     /* second hello, after a HelloRetryRequest */
 
+    /* Set by the flow tracker (Stage 4) */
+    unsigned reassembled_segments;          /* >0: decoded from this many TCP segments */
+    char     http_request_for[160];         /* on a response: "GET /path" it answers */
+    bool     cred_paired;                   /* PASS matched to this connection's USER */
+
     /* FTP / POP3 / IMAP command line */
     char     cmd[16];
     char     cmd_arg[APP_STR_MAX];
@@ -82,5 +87,15 @@ struct packet;
  * success (including "not a protocol we know"), -1 if the payload claimed to
  * be a protocol we decode but was malformed (pkt->error says why). */
 int decode_app(struct packet *pkt);
+
+/* Decode the reassembled start of a TCP stream (p, n) built from `segments`
+ * segments, and attach the result to pkt (the segment that completed it).
+ * Returns 0 if the message is still incomplete (keep buffering), 1 when done
+ * (decoded, or nothing we recognise: stop buffering). */
+int decode_app_reassembled(struct packet *pkt, const uint8_t *p, size_t n, unsigned segments);
+
+/* True if p[0..n) is too short to tell, but could be the start of a TLS
+ * handshake (a record header cut off after a few bytes). */
+bool app_tls_needs_more(const uint8_t *p, size_t n);
 
 #endif

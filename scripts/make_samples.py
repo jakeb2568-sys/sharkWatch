@@ -10,6 +10,10 @@ Writes:
   samples/edge_cases.pcap  packets designed to trip up a careless header parser
   samples/app_layer.pcap   DNS, HTTP, TLS and plaintext logins, plus hostile
                            application data (DNS compression loops, escape codes)
+  samples/flows.pcap       connection tracking and TCP reassembly: out-of-order
+                           and duplicate segments, an overlap with conflicting
+                           data, sequence wraparound, port reuse, RST, FTP login
+                           pairing, HTTP keep-alive
 
 All traffic is synthetic and the credentials are fake; no network access needed.
 """
@@ -232,9 +236,132 @@ def app_layer():
     return pkts
 
 
+class Conn:
+    """A TCP connection with real sequence/ack bookkeeping."""
+    def __init__(self, cli, srv, cport, sport, isn_c=1000, isn_s=5000):
+        self.ep = [(cli, cport), (srv, sport)]
+        self.seq = [isn_c & 0xFFFFFFFF, isn_s & 0xFFFFFFFF]
+
+    def _pkt(self, d, flags, payload=b"", seq=None):
+        (sip, sp), (dip, dp) = self.ep[d], self.ep[1 - d]
+        mac = (CLIENT_MAC, ROUTER_MAC) if d == 0 else (ROUTER_MAC, CLIENT_MAC)
+        s = self.seq[d] if seq is None else seq
+        tcp = TCP(sport=sp, dport=dp, flags=flags, seq=s & 0xFFFFFFFF,
+                  ack=self.seq[1 - d] if "A" in flags else 0, window=64240)
+        return eth(*mac) / IP(src=sip, dst=dip) / tcp / (Raw(payload) if payload else b"")
+
+    def handshake(self):
+        out = [self._pkt(0, "S")]
+        self.seq[0] += 1
+        out.append(self._pkt(1, "SA"))
+        self.seq[1] += 1
+        out.append(self._pkt(0, "A"))
+        return out
+
+    def send(self, d, payload, flags="PA"):
+        p = self._pkt(d, flags, payload)
+        self.seq[d] = (self.seq[d] + len(payload)) & 0xFFFFFFFF
+        return p
+
+    def segments(self, d, data, cuts):
+        """Split data at the given offsets; returns segments in stream order
+        without advancing the sequence (caller orders them, then calls skip)."""
+        bounds = [0] + list(cuts) + [len(data)]
+        return [self._pkt(d, "PA", data[a:b], seq=self.seq[d] + a) for a, b in zip(bounds, bounds[1:])]
+
+    def skip(self, d, n):
+        self.seq[d] = (self.seq[d] + n) & 0xFFFFFFFF
+
+    def close(self):
+        out = [self._pkt(0, "FA")]
+        self.seq[0] += 1
+        out.append(self._pkt(1, "FA"))
+        self.seq[1] += 1
+        out.append(self._pkt(0, "A"))
+        return out
+
+
+def flows():
+    pkts = []
+
+    # 1. A ClientHello in three segments, delivered out of order with a
+    #    duplicate: middle piece first, then the first piece twice.
+    c = Conn(CLIENT, SERVER, 52001, 443)
+    pkts += c.handshake()
+    hello = tls_client_hello("reassembled.example.com", ["h2", "http/1.1"])
+    s1, s2, s3 = c.segments(0, hello, [100, 300])
+    pkts += [s2, s1, s1.copy(), s3]
+    c.skip(0, len(hello))
+    pkts += c.close()
+
+    # 2. Overlapping retransmission with DIFFERENT bytes: the IDS-evasion
+    #    trick. Same length hostnames, so only the content changes.
+    c = Conn(CLIENT, SERVER, 52002, 443)
+    pkts += c.handshake()
+    good = tls_client_hello("innocent.example.com", ["h2"])
+    evil = good.replace(b"innocent.example.com", b"attacker.example.net")
+    cut = 150
+    a1, a2 = c.segments(0, good, [cut])
+    b1, b2 = c.segments(0, evil, [cut])
+    pkts += [a1, b1, a2]          # b1 rewrites bytes a1 already delivered
+    c.skip(0, len(good))
+    pkts += c.close()
+
+    # 3. Sequence numbers that wrap past 2^32 in the middle of the hello.
+    c = Conn(CLIENT, SERVER, 52003, 443, isn_c=0xFFFFFF00)
+    pkts += c.handshake()
+    hello = tls_client_hello("wraparound.example.com", ["h2"])
+    pkts += c.segments(0, hello, [0x100 - 1])   # stream offset 255 = seq 0x00000000
+    c.skip(0, len(hello))
+    pkts += c.close()
+
+    # 4. FTP: USER and PASS on one connection get paired into one login.
+    c = Conn(CLIENT, "10.0.0.21", 52004, 21)
+    pkts += c.handshake()
+    pkts += [c.send(1, b"220 ready\r\n"), c.send(0, b"USER alice\r\n"),
+             c.send(1, b"331 password please\r\n"), c.send(0, b"PASS hunter2\r\n"),
+             c.send(1, b"230 logged in\r\n")]
+    pkts += c.close()
+
+    # 5. HTTP keep-alive: two requests, each response matched to its request.
+    c = Conn(CLIENT, "10.0.0.80", 52005, 80)
+    pkts += c.handshake()
+    pkts += [c.send(0, b"GET /index.html HTTP/1.1\r\nHost: shop.example\r\n\r\n"),
+             c.send(1, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"),
+             c.send(0, b"GET /missing.png HTTP/1.1\r\nHost: shop.example\r\n\r\n"),
+             c.send(1, b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")]
+    pkts += c.close()
+
+    # 6. Port reuse: the same client port connects twice in a row.
+    for i in range(2):
+        c = Conn(CLIENT, "10.0.0.80", 52006, 80, isn_c=7000 + i * 100000)
+        pkts += c.handshake()
+        pkts += [c.send(0, b"GET /again HTTP/1.1\r\nHost: shop.example\r\n\r\n")]
+        pkts += c.close()
+
+    # 7. Mid-stream: the capture starts after the handshake.
+    c = Conn(CLIENT, SERVER, 52007, 443, isn_c=123456, isn_s=654321)
+    pkts += [c.send(0, b"\x17\x03\x03\x00\x05hello"), c.send(1, b"\x17\x03\x03\x00\x05world")]
+
+    # 8. Reset: the server refuses the connection.
+    c = Conn(CLIENT, SERVER, 52008, 25)
+    pkts.append(c._pkt(0, "S"))
+    c.seq[0] += 1
+    pkts.append(c._pkt(1, "RA"))
+
+    # 9. UDP: a DNS query and its answer form one conversation.
+    pkts.append(eth() / IP(src=CLIENT, dst=DNS_SRV) / UDP(sport=52009, dport=53)
+                / DNS(id=0x7777, rd=1, qd=DNSQR(qname="flows.example.com")))
+    pkts.append(eth(ROUTER_MAC, CLIENT_MAC) / IP(src=DNS_SRV, dst=CLIENT) / UDP(sport=53, dport=52009)
+                / DNS(id=0x7777, qr=1, ra=1, qd=DNSQR(qname="flows.example.com"),
+                      an=[DNSRR(rrname="flows.example.com", type="A", rdata="203.0.113.7", ttl=60)]))
+    return pkts
+
+
 if __name__ == "__main__":
     OUT.mkdir(exist_ok=True)
     write(OUT / "basic.pcap", basic(), start=1_700_000_000.0)
     write(OUT / "edge_cases.pcap", edge_cases(), start=1_700_000_100.0)
     write(OUT / "app_layer.pcap", app_layer(), start=1_700_000_200.0)
-    print(f"wrote basic.pcap, edge_cases.pcap and app_layer.pcap to {OUT}")
+    write(OUT / "flows.pcap", flows(), start=1_700_000_300.0)
+    print(f"wrote basic.pcap, edge_cases.pcap, app_layer.pcap and flows.pcap to {OUT}")

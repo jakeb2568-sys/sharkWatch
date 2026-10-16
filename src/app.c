@@ -584,6 +584,8 @@ static int decode_command(packet_t *pkt, app_type_t proto, const uint8_t *p, siz
 /* Dispatch                                                                 */
 /* ------------------------------------------------------------------------ */
 
+static int decode_tcp_payload(packet_t *pkt, const uint8_t *p, size_t n);
+
 static bool either_port(const packet_t *pkt, uint16_t port)
 {
     return pkt->src_port == port || pkt->dst_port == port;
@@ -605,7 +607,13 @@ int decode_app(packet_t *pkt)
 
     if (pkt->l4 != L4_TCP)
         return 0;
+    return decode_tcp_payload(pkt, p, n);
+}
 
+/* Decode a TCP payload: either one segment's bytes, or (from the flow
+ * tracker) the reassembled start of a stream. */
+static int decode_tcp_payload(packet_t *pkt, const uint8_t *p, size_t n)
+{
     /* HTTP and TLS are recognised by their content, so they're found on any
      * port. (A web server on an odd port is itself worth noticing.)
      *
@@ -637,4 +645,49 @@ int decode_app(packet_t *pkt)
     case 143: return decode_command(pkt, APP_IMAP, p, n);
     default:  return 0;
     }
+}
+
+bool app_tls_needs_more(const uint8_t *p, size_t n)
+{
+    size_t skip = 0;
+    while (n - skip >= 6 && p[skip] == TLS_CONTENT_CCS && p[skip + 1] == 0x03) {
+        size_t rec = 5 + (size_t)rd16(p + skip + 3);
+        if (rec > n - skip)
+            return true;                        /* ChangeCipherSpec record itself cut off */
+        skip += rec;
+    }
+    size_t r = n - skip;
+    if (r >= 6)
+        return false;                           /* long enough to know what it is */
+    const uint8_t *q = p + skip;
+    return r == 0 || ((q[0] == TLS_CONTENT_HANDSHAKE || q[0] == TLS_CONTENT_CCS) &&
+                      (r < 2 || q[1] == 0x03));
+}
+
+int decode_app_reassembled(packet_t *pkt, const uint8_t *p, size_t n, unsigned segments)
+{
+    app_t saved = pkt->app;
+    const char *saved_error = pkt->error;
+
+    memset(&pkt->app, 0, sizeof pkt->app);
+    decode_tcp_payload(pkt, p, n);
+
+    if (pkt->app.type == APP_TLS_CLIENT_HELLO && pkt->app.tls_partial) {
+        pkt->app = saved;                       /* still incomplete: keep waiting */
+        pkt->error = saved_error;
+        return 0;
+    }
+    if (pkt->app.type == APP_NONE && app_tls_needs_more(p, n)) {
+        pkt->app = saved;                       /* a TLS record header, cut short */
+        pkt->error = saved_error;
+        return 0;
+    }
+    if (pkt->app.type == APP_NONE) {            /* nothing we decode: give up */
+        pkt->app = saved;
+        pkt->error = saved_error;
+        return 1;
+    }
+    pkt->error = saved_error;                   /* this segment's headers were fine */
+    pkt->app.reassembled_segments = segments;
+    return 1;
 }

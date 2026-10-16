@@ -5,6 +5,7 @@
  * prints one line per packet plus a summary at the end.
  */
 #include "decode.h"
+#include "flow.h"
 #include "print.h"
 #include "proto.h"
 
@@ -42,6 +43,7 @@ struct ctx {
     struct stats st;
     struct cred_seen creds[MAX_CREDS_LISTED];
     int ncreds;
+    flow_table_t *flows;
 };
 
 static pcap_t *g_handle;   /* for the signal handler */
@@ -83,6 +85,8 @@ static void count(struct stats *st, const packet_t *pkt, int rc)
         st->other_l3++;
     }
 
+    if (pkt->retransmission)
+        return;                       /* already counted when first seen */
     switch (pkt->app.type) {
     case APP_DNS:
         if (pkt->app.dns_response) st->dns_responses++; else st->dns_queries++;
@@ -102,7 +106,7 @@ static void count(struct stats *st, const packet_t *pkt, int rc)
 
 static void remember_credential(struct ctx *c, const packet_t *pkt)
 {
-    if (pkt->app.cred == CRED_NONE || c->ncreds >= MAX_CREDS_LISTED)
+    if (pkt->app.cred == CRED_NONE || pkt->retransmission || c->ncreds >= MAX_CREDS_LISTED)
         return;
     struct cred_seen *cs = &c->creds[c->ncreds++];
     char what[512], s[INET_ADDRSTRLEN], d[INET_ADDRSTRLEN];
@@ -125,6 +129,7 @@ static void on_packet(u_char *user, const struct pcap_pkthdr *hdr,
     }
 
     int rc = decode_packet(c->linktype, hdr, bytes, &pkt);
+    flow_update(c->flows, &pkt);      /* may add reassembled / per-connection info */
     count(&c->st, &pkt, rc);
     remember_credential(c, &pkt);
     if (c->tsv)
@@ -148,6 +153,20 @@ static void print_summary(FILE *out, const struct ctx *c)
             s->dns_queries, s->dns_responses, s->http_requests, s->http_responses,
             s->tls_hellos, s->tls_sni, s->malformed);
 
+    const flow_stats_t *f = flow_stats(c->flows);
+    fprintf(out,
+            "  Flows: %llu TCP (%llu handshakes, %llu mid-stream, %llu reset, %llu port reuse), "
+            "%llu UDP; peak %llu active\n"
+            "  Reassembly: %llu split ClientHello(s) rebuilt, %llu retransmission(s), "
+            "%llu overlap conflict(s)\n",
+            f->tcp_flows, f->handshakes, f->midstream, f->resets, f->port_reuse,
+            f->udp_flows, f->peak_active, f->reassembled, f->retransmissions,
+            f->overlap_conflicts);
+    if (f->evicted || f->expired || f->reassembly_skipped)
+        fprintf(out, "  Limits hit: %llu flows evicted (table full), %llu expired (idle), "
+                     "%llu reassemblies skipped (memory budget)\n",
+                f->evicted, f->expired, f->reassembly_skipped);
+
     if (s->creds) {
         fprintf(out, "\n  !! %llu cleartext credential(s) seen:\n", s->creds);
         for (int i = 0; i < c->ncreds; i++)
@@ -169,11 +188,14 @@ static void usage(FILE *out, const char *prog)
             "  -v          verbose: add an L2/L3 detail line per packet\n"
             "  -T          tab-separated fields instead (see print.h for columns)\n"
             "  -P          show cleartext passwords instead of ******** \n"
+            "  -F N        after the packets, list the top N conversations by bytes\n"
+            "              (0 = all; with -T, as tab-separated \"flow\" rows)\n"
+            "  -m N        track at most N connections at once (default %d)\n"
             "  -h          show this help\n"
             "\n"
             "Anything after the options is a BPF filter, same syntax as\n"
             "tcpdump and Wireshark capture filters, e.g.  tcp port 443\n",
-            prog, DEFAULT_SNAPLEN);
+            prog, DEFAULT_SNAPLEN, FLOW_DEFAULT_MAX);
 }
 
 /* Join argv[from..] into one string, the way tcpdump does for its filter. */
@@ -198,9 +220,11 @@ int main(int argc, char **argv)
     char errbuf[PCAP_ERRBUF_SIZE] = "";
     const char *file = NULL, *iface = NULL;
     int max_packets = -1, snaplen = DEFAULT_SNAPLEN, opt;
+    int report_n = 10, max_flows = 0;
+    bool want_report = false;
     struct ctx c = { 0 };
 
-    while ((opt = getopt(argc, argv, "r:i:c:s:vTPh")) != -1) {
+    while ((opt = getopt(argc, argv, "r:i:c:s:vTPF:m:h")) != -1) {
         switch (opt) {
         case 'r': file = optarg; break;
         case 'i': iface = optarg; break;
@@ -209,6 +233,8 @@ int main(int argc, char **argv)
         case 'v': c.verbose = true; break;
         case 'T': c.tsv = true; break;
         case 'P': print_set_reveal_passwords(true); break;
+        case 'F': report_n = atoi(optarg); want_report = report_n >= 0; break;
+        case 'm': max_flows = atoi(optarg); break;
         case 'h': usage(stdout, argv[0]); return EXIT_SUCCESS;
         default:  usage(stderr, argv[0]); return EXIT_FAILURE;
         }
@@ -217,8 +243,12 @@ int main(int argc, char **argv)
         usage(stderr, argv[0]);
         return EXIT_FAILURE;
     }
-    if (max_packets == 0 || snaplen <= 0) {
-        fprintf(stderr, "-c and -s must be positive\n");
+    if (max_packets == 0 || snaplen <= 0 || max_flows < 0 || report_n < 0) {
+        fprintf(stderr, "-c, -s and -m must be positive, -F zero or more\n");
+        return EXIT_FAILURE;
+    }
+    if (!(c.flows = flow_table_new((unsigned)max_flows, want_report ? (unsigned)report_n : 1))) {
+        fprintf(stderr, "sharkwatch: out of memory\n");
         return EXIT_FAILURE;
     }
 
@@ -260,6 +290,9 @@ int main(int argc, char **argv)
         status = EXIT_FAILURE;
     }
 
+    flow_finish(c.flows);
+    if (want_report)
+        flow_print_report(c.flows, stdout, c.tsv);
     fflush(stdout);   /* so the summary lands after the packet lines when piped */
     print_summary(stderr, &c);
     if (iface) {
@@ -269,6 +302,7 @@ int main(int argc, char **argv)
     }
 
 out:
+    flow_table_free(c.flows);
     free(filter);
     pcap_close(h);
     return status;

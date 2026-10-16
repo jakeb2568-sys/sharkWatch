@@ -9,7 +9,7 @@ SRC  := $(wildcard src/*.c)
 OBJ  := $(SRC:src/%.c=build/%.o)
 HDRS := $(wildcard include/*.h)
 
-.PHONY: all clean sanitize test
+.PHONY: all clean sanitize test check
 
 all: $(BIN)
 
@@ -32,6 +32,12 @@ sanitize: clean
 # Compare our decoding field-by-field with Wireshark's (needs tshark + python3)
 test: $(BIN)
 	python3 tests/verify_against_tshark.py ./$(BIN) samples/*.pcap
+
+# Everything in `test`, plus the reassembly property test and the
+# resource-exhaustion tests (need scapy; the stress test needs Linux)
+check: test
+	python3 tests/reassembly_property.py ./$(BIN) 2000
+	python3 tests/stress_flows.py ./$(BIN)
 
 clean:
 	rm -rf build $(BIN)
